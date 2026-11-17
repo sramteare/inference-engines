@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# llm-stop - stop running llama-server instance(s). Usage: llm-stop [port]
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "Usage: llm-stop [port]"
+  echo "Stops running llama-server process(es) (optionally filtered by --port <port>)."
+  exit 0
+fi
+PORT="${1:-}"
+find_pids() {
+  if [[ -n "$PORT" ]]; then
+    pgrep -a -x llama-server | awk -v p="--port $PORT" 'index($0, p) {print $1}'
+  else
+    pgrep -x llama-server
+  fi
+}
+
+PIDS="$(find_pids || true)"
+if [[ -n "$PIDS" ]]; then
+  kill $PIDS 2>/dev/null || true
+  for _ in {1..20}; do
+    [[ -z "$(find_pids || true)" ]] && { echo "Stopped."; exit 0; }
+    sleep 0.5
+  done
+  PIDS="$(find_pids || true)"
+  [[ -n "$PIDS" ]] && { echo "Still running; forcing."; kill -9 $PIDS 2>/dev/null || true; }
+else
+  echo "No llama-server running."
+fi

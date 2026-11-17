@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# llm-serve - unified CLI to start, stop, and inspect local llama-server profiles.
+set -euo pipefail
+
+main() {
+  # Not `local`: that would hide the environment overrides documented below.
+  local ENGINES DAEMON
+  ENGINES="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+  MODELS="${MODELS:-$HOME/dev/models}"
+  LLAMA_BIN="${LLAMA_BIN:-$ENGINES/llama.cpp/build/bin/llama-server}"
+  LOG_DIR="${LOG_DIR:-$ENGINES/logs}"
+  HOST="${HOST:-0.0.0.0}"
+  PORT="${PORT:-8000}"
+  SPEC="${SPEC:-1}"
+  DAEMON=0
+
+  usage() {
+    cat <<'EOF'
+Usage:
+  llm-serve [-d] [profile] [extra llama-server args...]
+  llm-serve --status [--port N]       One-shot server & GPU status snapshot
+  llm-serve --stats  [--port N ...]   Live terminal dashboard (Ctrl+C to exit)
+  llm-serve --stop   [port]           Stop running llama-server instance(s)
+  llm-serve --list                    List available model profiles
+  llm-serve -h | --help               Show this help message
+
+Profiles:
+  qwen      Qwen3.8-Flash-Next UD-Q4_K_XL + MTP Q8_0, 256k native ctx (default)
+  deepseek  DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL + DSpark Q8_0, 512k ctx
+
+Flags / Subcommands:
+  -d                Run server in background (logs to $LOG_DIR/llama-<profile>.log)
+  --status, status  Print current server status and metrics snapshot (--once)
+  --stats,  stats   Launch live metrics dashboard (passes extra args to llm-stats)
+  --stop,   stop    Stop running llama-server (optionally filtered by port)
+  --list,   list    List available profiles
+  -h, --help, help  Show this help message
+
+Environment overrides:
+  SPEC=1|0    Enable (1, default) or disable (0) speculative decoding (MTP / DSpark)
+  CTX=N       Override context window size (default: 262144 qwen, 524288 deepseek)
+  PORT=N      Server port (default: 8000)
+  HOST=ADDR   Bind address (default: 0.0.0.0)
+  MODELS=DIR  Models root directory (default: ~/dev/models)
+  LOG_DIR=DIR Log directory (default: ~/dev/engines/logs)
+EOF
+  }
+
+  do_stop() {
+    local target_port="${1:-}"
+    find_pids() {
+      if [[ -n "$target_port" ]]; then
+        pgrep -a -x llama-server | awk -v p="--port $target_port" 'index($0, p) {print $1}'
+      else
+        pgrep -x llama-server
+      fi
+    }
+    local pids
+    pids="$(find_pids || true)"
+    if [[ -n "$pids" ]]; then
+      kill $pids 2>/dev/null || true
+      for _ in {1..20}; do
+        [[ -z "$(find_pids || true)" ]] && { echo "Stopped."; return 0; }
+        sleep 0.5
+      done
+      pids="$(find_pids || true)"
+      [[ -n "$pids" ]] && { echo "Still running; forcing."; kill -9 $pids 2>/dev/null || true; }
+    else
+      echo "No llama-server running."
+    fi
+  }
+
+  do_status() {
+    local pids
+    pids="$(pgrep -x llama-server || true)"
+    if [[ -z "$pids" ]]; then
+      echo "No llama-server running."
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu \
+          --format=csv,noheader | awk -F', ' '{printf "GPU: %s | Util: %s | VRAM: %s / %s | Power: %s | Temp: %s C\n", $1, $2, $3, $4, $5, $6}'
+      fi
+      return 0
+    fi
+    ps -p $pids -o pid,etime,%cpu,%mem,rss,cmd
+    echo
+    "$ENGINES/bin/llm-stats" --port "$PORT" --once "$@"
+  }
+
+  if [[ "${1:-}" == "-d" ]]; then
+    DAEMON=1
+    shift
+  fi
+
+  case "${1:-}" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+    --list|list)
+      echo "Profiles:"
+      echo "  qwen      Qwen3.8-Flash-Next UD-Q4_K_XL + MTP Q8_0, 256k native ctx (default)"
+      echo "  deepseek  DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL + DSpark Q8_0, 512k ctx"
+      return 0
+      ;;
+    --stop|stop)
+      shift
+      do_stop "${1:-}"
+      return 0
+      ;;
+    --status|status)
+      shift
+      do_status "$@"
+      return 0
+      ;;
+    --stats|stats)
+      shift
+      exec "$ENGINES/bin/llm-stats" --port "$PORT" "$@"
+      ;;
+  esac
+
+  local PROFILE="${1:-qwen}"
+  [[ $# -gt 0 ]] && shift
+
+  local -a ARGS=()
+  case "$PROFILE" in
+    qwen)
+      # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP Q8_0 draft head, 256k native ctx (set CTX=524288 for YaRN 2x)
+      local ctx="${CTX:-262144}"
+      ARGS=(
+        -m  "$MODELS/qwen3.8-unsloth-v3.1/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+        -c "$ctx" -np 1
+        -ctk q8_0 -ctv q8_0 -fa on
+        --load-mode none
+        --alias qwen3.8-flash-next
+      )
+      if (( SPEC )); then
+        ARGS+=(-md "$MODELS/qwen3.8-unsloth-v3.1/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf" --spec-type draft-mtp --spec-draft-n-max 2)
+      fi
+      if (( ctx > 262144 )); then
+        ARGS+=(--rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144)
+      fi
+      ;;
+    deepseek)
+      # DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL (~312 GiB) + DSpark Q8_0 drafter.
+      # NOTE: larger than VRAM+RAM, so part of it is paged from disk via mmap.
+      # Benchmark (v1.0.0) showed -fit on outperforms -cmoe when mmap'd > RAM.
+      local ctx="${CTX:-524288}"
+      ARGS=(
+        -m  "$MODELS/deepseek-v41-1017/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf"
+        -c "$ctx" -np 1
+        -ctk q8_0 -ctv q8_0 -fa on
+        --alias deepseek-v4.1-flash
+      )
+      if (( SPEC )); then
+        ARGS+=(-md "$MODELS/deepseek-v41-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf" --spec-type draft-dspark --spec-draft-n-max 3 -fitt 12288)
+      else
+        ARGS+=(-fitt 4096)
+      fi
+      ;;
+    *)
+      echo "Unknown profile or flag: $PROFILE (try: llm-serve --help)" >&2
+      return 1
+      ;;
+  esac
+
+  # Point opencode's default model at the profile being started, so new
+  # opencode sessions show the model that is actually loaded (with its limits).
+  # Set OPENCODE_SYNC=0 to skip.
+  sync_opencode() {
+    local cfg="${OPENCODE_CONFIG_FILE:-$HOME/.config/opencode/opencode.json}"
+    local provider="${OPENCODE_PROVIDER:-llamacpp}"
+    [[ "${OPENCODE_SYNC:-1}" == 1 && -f "$cfg" ]] || return 0
+    command -v jq >/dev/null 2>&1 || { echo "opencode: jq not found; default model not updated." >&2; return 0; }
+
+    local alias="" ctx="" i
+    for (( i = 0; i < ${#ARGS[@]} - 1; i++ )); do
+      case "${ARGS[i]}" in
+        --alias) alias="${ARGS[i+1]%%,*}" ;;
+        -c)      ctx="${ARGS[i+1]}" ;;
+      esac
+    done
+    [[ -n "$alias" ]] || return 0
+
+    local base
+    base="$(jq -r --arg p "$provider" '.provider[$p].options.baseURL // ""' "$cfg")"
+    if [[ "$base" != *":$PORT/"* ]]; then
+      echo "opencode: provider '$provider' points at ${base:-nothing}, not port $PORT; default model not updated."
+      return 0
+    fi
+    if ! jq -e --arg p "$provider" --arg m "$alias" '.provider[$p].models[$m]' "$cfg" >/dev/null; then
+      echo "opencode: no '$provider/$alias' entry in $cfg; add one to sync it." >&2
+      return 0
+    fi
+
+    local tmp
+    tmp="$(mktemp "$cfg.XXXXXX")"
+    if jq --arg p "$provider" --arg m "$alias" --arg ctx "$ctx" '
+          .model = "\($p)/\($m)" | .small_model = "\($p)/\($m)"
+          | if $ctx != "" then .provider[$p].models[$m].limit.context = ($ctx | tonumber) else . end
+        ' "$cfg" >"$tmp"; then
+      cat "$tmp" >"$cfg" && rm -f "$tmp"   # rewrite in place: keeps file mode/owner
+      echo "opencode: default model -> $provider/$alias${ctx:+ (ctx $ctx)}"
+    else
+      rm -f "$tmp"
+      echo "opencode: failed to update $cfg" >&2
+    fi
+  }
+
+  if pgrep -a -x llama-server | grep -q -- "--port $PORT"; then
+    echo "A llama-server is already running on port $PORT. Stop it with: llm-serve --stop" >&2
+    return 1
+  fi
+
+  sync_opencode
+
+  mkdir -p "$LOG_DIR"
+  local LOG="$LOG_DIR/llama-$PROFILE.log"
+  local -a CMD=("$LLAMA_BIN" "${ARGS[@]}" --metrics --log-timestamps --host "$HOST" --port "$PORT" "$@")
+
+  echo "Profile: $PROFILE   Endpoint: http://$HOST:$PORT/v1   Log: $LOG"
+  echo "Status:  llm-serve --status   Live stats: llm-serve --stats   Stop: llm-serve --stop"
+
+  if (( DAEMON )); then
+    setsid nohup "${CMD[@]}" >"$LOG" 2>&1 < /dev/null &
+    disown
+    echo "Started in background (PID $!). Follow the log: tail -f $LOG"
+  else
+    "${CMD[@]}" 2>&1 | tee "$LOG"
+  fi
+}
+
+main "$@"
+exit $?

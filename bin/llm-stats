@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""llm-stats - live dashboard for a running llama-server.
+
+Usage: llm-stats [--port 8000] [--host localhost] [--interval 1] [--once]
+Requires llama-server started with --metrics (llm-serve does this).
+"""
+import argparse, json, re, subprocess, sys, time, urllib.request
+
+p = argparse.ArgumentParser()
+p.add_argument("--host", default="localhost")
+p.add_argument("--port", type=int, default=8000)
+p.add_argument("--interval", type=float, default=1.0)
+p.add_argument("--once", action="store_true")
+a = p.parse_args()
+BASE = f"http://{a.host}:{a.port}"
+
+
+def get(path, as_json=True):
+    with urllib.request.urlopen(BASE + path, timeout=2) as r:
+        body = r.read().decode()
+    return json.loads(body) if as_json else body
+
+
+def metrics():
+    out = {}
+    for line in get("/metrics", as_json=False).splitlines():
+        m = re.match(r"^llamacpp:(\w+)(?:\{[^}]*\})?\s+([-\d.eE+naNinf]+)$", line)
+        if m:
+            out[m.group(1)] = float(m.group(2))
+    return out
+
+
+def gpu():
+    try:
+        q = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+             "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3).stdout.strip()
+        u, mu, mt, pw, t = [x.strip() for x in q.splitlines()[0].split(",")]
+        return f"GPU {u:>3}%  VRAM {float(mu)/1024:5.1f}/{float(mt)/1024:.1f} GiB  {float(pw):5.0f} W  {t} C"
+    except Exception:
+        return "GPU n/a"
+
+
+def bar(frac, width=30):
+    frac = max(0.0, min(1.0, frac))
+    n = int(frac * width)
+    return "[" + "#" * n + "-" * (width - n) + f"] {frac*100:5.1f}%"
+
+
+PREV = {}
+
+
+def rate(m, tok_key, sec_key):
+    """(last, average) tok/s. last = most recently finished request(s); sticky."""
+    tok, sec = m.get(tok_key, 0.0), m.get(sec_key, 0.0)
+    avg = tok / sec if sec > 0 else 0.0
+    if tok_key in PREV:
+        dt, ds = tok - PREV[tok_key], sec - PREV[sec_key]
+        if ds > 0:
+            PREV[tok_key + "_last"] = dt / ds
+    PREV[tok_key], PREV[sec_key] = tok, sec
+    return PREV.get(tok_key + "_last"), avg
+
+
+def fmt_rate(live, avg):
+    l = f"{live:8.1f}" if live is not None else "       -"
+    return f"last {l} tok/s   avg {avg:8.1f} tok/s"
+
+
+def render():
+    lines = []
+    try:
+        props = get("/props")
+        model = props.get("model_alias") or props.get("model_path", "?").rsplit("/", 1)[-1]
+    except Exception:
+        model = "?"
+    try:
+        m = metrics()
+    except Exception as e:
+        return f"Cannot reach {BASE}/metrics ({e}).\nIs llama-server running with --metrics?  (llm-serve)"
+
+    lines.append(f"llama-server @ {BASE}   model: {model}")
+    lines.append("-" * 72)
+    lines.append(f"Load       processing: {int(m.get('requests_processing', 0))}   "
+                 f"queued: {int(m.get('requests_deferred', 0))}")
+    lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"))
+                 + f"   ({int(m.get('prompt_tokens_total', 0))} tok, "
+                 f"{int(m.get('prompt_tokens_cached_total', 0))} cached)")
+    lines.append("Generate   " + fmt_rate(*rate(m, "tokens_predicted_total", "tokens_predicted_seconds_total"))
+                 + f"   ({int(m.get('tokens_predicted_total', 0))} tok)")
+    d = m.get("spec_decode_num_draft_tokens_total")
+    if d is not None:
+        acc = m.get("spec_decode_num_accepted_tokens_total", 0)
+        lines.append(f"MTP draft  accepted {int(acc)}/{int(d)}" + (f"  ({acc/d*100:.1f}%)" if d else ""))
+
+    try:
+        slots = get("/slots")
+        now = time.monotonic()
+        for s in slots:
+            n_ctx = s.get("n_ctx", 0) or 1
+            nt = s.get("next_token")
+            nt = nt[0] if isinstance(nt, list) and nt else (nt or {})
+            dec = nt.get("n_decoded", 0) or 0
+            used = (s.get("n_prompt_tokens", 0) or 0) + dec
+            busy = s.get("is_processing")
+            key = f"slot{s.get('id', 0)}"
+            live = ""
+            if busy and key in PREV:
+                pdec, pt = PREV[key]
+                if dec >= pdec and now > pt:
+                    live = f"  gen now {(dec - pdec) / (now - pt):6.1f} tok/s"
+            PREV[key] = (dec, now)
+            state = "busy" if busy else "idle"
+            lines.append(f"Slot {s.get('id', 0)}     {state:<5} ctx {used:>7}/{n_ctx}  {bar(used / n_ctx, 20)}{live}")
+    except Exception:
+        pass
+
+    lines.append(gpu())
+    lines.append("-" * 72)
+    lines.append("last = most recent request, avg = since server start. Ctrl+C to exit.")
+    return "\n".join(lines)
+
+
+try:
+    while True:
+        out = render()
+        if a.once:
+            print(out)
+            break
+        sys.stdout.write("\033[H\033[2J" + out + "\n")
+        sys.stdout.flush()
+        time.sleep(a.interval)
+except KeyboardInterrupt:
+    pass

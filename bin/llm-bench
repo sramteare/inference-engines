@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""llm-bench - reproducible benchmark suite for llama-server (cold, warm, long-context, MoE cache stats).
+
+Supports benchmarking an already-running server (`--url`) or running an automated A/B suite
+across `-fit on` vs `-cmoe --moe-cache-mib` configurations (`--suite deepseek-ab`).
+"""
+import argparse
+import json
+import os
+import re
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ENGINES = Path(__file__).resolve().parent.parent
+MODELS = Path(os.environ.get("MODELS", Path.home() / "dev/models"))
+LLAMA_BIN = Path(os.environ.get("LLAMA_BIN", ENGINES / "llama.cpp/build/bin/llama-server"))
+
+SHORT_PROMPTS = [
+    ("cold_warm_probe", "Explain how virtual memory page tables, TLB shootdowns, and huge pages affect throughput on multi-socket NUMA Linux systems."),
+    ("rust_spsc", "Implement a lock-free single-producer single-consumer ring buffer in Rust using only std::sync::atomic, and explain every Ordering choice."),
+    ("sql_orderbook", "Design a PostgreSQL schema, indexes, and snapshot query for an event-sourced limit order book that supports point-in-time replay."),
+    ("math_combinatorics", "Prove by induction and by a combinatorial bijection that sum_{k=0}^n C(n,k)^2 = C(2n,n), then generalize to Vandermonde's identity."),
+    ("linux_nvme", "Trace what happens in the Linux kernel block layer when mmap page faults read randomly from an NVMe SSD under memory pressure."),
+    ("python_async", "Write a small Python asyncio connection pool with bounded concurrency, per-request timeouts, and graceful drain on shutdown."),
+]
+
+
+def build_long_prompt(target_words: int) -> str:
+    """Build a varied multi-section technical document so prefill exercises real tokens without trivial repetition."""
+    topics = [
+        "kernel page reclaim and kswapd watermarks under mixed anonymous and file-backed mmap workloads",
+        "PCIe Gen5 root complex ordering, DMA ring descriptors, and pinned host staging buffers",
+        "Mixture-of-Experts top-k gating, router load-balancing losses, and token capacity factors",
+        "NVMe submission and completion queues, I/O schedulers, and read-ahead window heuristics",
+        "PostgreSQL MVCC tuple visibility, vacuum freeze horizons, and B-tree page split contention",
+        "CUDA graph capture, virtual memory management allocations, and host-to-device stream overlap",
+    ]
+    blocks = []
+    idx = 0
+    words = 0
+    while words < target_words:
+        topic = topics[idx % len(topics)]
+        block = (
+            f"Section {idx + 1}: Analysis of {topic}. "
+            f"In scenario #{idx * 17 + 3}, consider a worker pool of {(idx % 16) + 4} threads handling "
+            f"batches of {(idx % 8 + 1) * 64} items with latency budget {15 + (idx % 45)} ms. "
+            f"Explain how contention on shared cache lines, memory bandwidth saturation, and tail latency "
+            f"behave as queue depth scales from {2 ** (idx % 5)} to {2 ** ((idx % 5) + 3)}.\n\n"
+        )
+        blocks.append(block)
+        words += len(block.split())
+        idx += 1
+    return (
+        "Summarize the primary bottlenecks across the following system notes and list concrete mitigations:\n\n"
+        + "".join(blocks)
+    )
+
+
+def http_json(url: str, body: dict | None = None, timeout: int = 600) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def read_metrics(base_url: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    with urllib.request.urlopen(base_url + "/metrics", timeout=5) as resp:
+        for line in resp.read().decode().splitlines():
+            m = re.match(r"^llamacpp:(\w+)(?:\{[^}]*\})?\s+([-\d.eE+naNinf]+)$", line)
+            if m:
+                out[m.group(1)] = float(m.group(2))
+    return out
+
+
+def check_idle(base_url: str, force: bool) -> None:
+    try:
+        m = read_metrics(base_url)
+    except Exception:
+        return
+    busy = int(m.get("requests_processing", 0)) + int(m.get("requests_deferred", 0))
+    if busy > 0 and not force:
+        sys.exit(f"Refusing to run: {base_url} currently has {busy} active/queued request(s). Pass --force to override.")
+
+
+def run_chat_case(base_url: str, name: str, content: str, max_tokens: int, temp: float, seed: int) -> dict:
+    m_before = read_metrics(base_url)
+    t0 = time.monotonic()
+    resp = http_json(
+        base_url + "/v1/chat/completions",
+        {
+            "model": "benchmark",
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": max_tokens,
+            "temperature": temp,
+            "seed": seed,
+            "cache_prompt": False,
+        },
+        timeout=900,
+    )
+    wall_s = time.monotonic() - t0
+    m_after = read_metrics(base_url)
+    timings = resp.get("timings", {})
+
+    drafts = m_after.get("spec_decode_num_draft_tokens_total", 0.0) - m_before.get("spec_decode_num_draft_tokens_total", 0.0)
+    accepted = m_after.get("spec_decode_num_accepted_tokens_total", 0.0) - m_before.get("spec_decode_num_accepted_tokens_total", 0.0)
+    acc_pct = (100.0 * accepted / drafts) if drafts > 0 else None
+
+    return {
+        "name": name,
+        "prompt_n": timings.get("prompt_n", 0),
+        "prompt_tps": timings.get("prompt_per_second", 0.0),
+        "prompt_ms": timings.get("prompt_ms", 0.0),
+        "gen_n": timings.get("predicted_n", 0),
+        "gen_tps": timings.get("predicted_per_second", 0.0),
+        "gen_ms": timings.get("predicted_ms", 0.0),
+        "wall_s": wall_s,
+        "draft_acc_pct": acc_pct,
+    }
+
+
+def wait_for_health(proc: subprocess.Popen, base_url: str, log_path: Path) -> None:
+    while True:
+        if proc.poll() is not None:
+            tail = log_path.read_text(errors="replace").splitlines()[-30:]
+            sys.exit(f"llama-server exited ({proc.returncode}):\n" + "\n".join(tail))
+        try:
+            if http_json(base_url + "/health", timeout=5).get("status") == "ok":
+                return
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+def parse_moe_cache_stats(log_text: str) -> dict:
+    stats = {}
+    for m in re.finditer(
+        r"llama_moe_cache:\s+ubatch\s+(<= 8|> 8):\s+hits = (\d+), misses = (\d+) \((\d+) on the CPU\), hit rate = ([0-9.]+)%, uploaded = ([0-9.]+) MiB",
+        log_text,
+    ):
+        key = "decode" if "<= 8" in m.group(1) else "prefill"
+        stats[key] = {
+            "hits": int(m.group(2)),
+            "misses": int(m.group(3)),
+            "cpu_misses": int(m.group(4)),
+            "hit_rate_pct": float(m.group(5)),
+            "uploaded_mib": float(m.group(6)),
+        }
+    return stats
+
+
+def run_suite_against_url(base_url: str, max_tokens: int, temp: float, seed: int, long_words: list[int]) -> dict:
+    results = []
+    # Stage 1: Cold request (first request on fresh server)
+    cold_name, cold_prompt = SHORT_PROMPTS[0]
+    results.append(("cold", run_chat_case(base_url, cold_name, cold_prompt, max_tokens, temp, seed)))
+    # Stage 2: Warm short-context suite (5 diverse prompts)
+    for name, prompt in SHORT_PROMPTS[1:]:
+        results.append(("warm", run_chat_case(base_url, name, prompt, max_tokens, temp, seed)))
+    # Stage 3: Long-context prefill + post-prefill decode
+    for words in long_words:
+        lp = build_long_prompt(words)
+        results.append(("long", run_chat_case(base_url, f"long_{words}w", lp, max_tokens, temp, seed)))
+    return {"cases": [{"stage": st, **r} for st, r in results]}
+
+
+def deepseek_configs(ctx: int, moe_mib: int) -> list[tuple[str, list[str]]]:
+    model = str(MODELS / "deepseek-v41-1017/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf")
+    draft = str(MODELS / "deepseek-v41-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf")
+    common = ["-m", model, "-c", str(ctx), "-np", "1", "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on", "--metrics", "--log-timestamps", "-lv", "4"]
+    dspark = ["-md", draft, "--spec-type", "draft-dspark", "--spec-draft-n-max", "3"]
+    return [
+        ("fit_on_dspark", common + dspark + ["-fitt", "12288"]),
+        (f"cmoe_{moe_mib}_share0_dspark", common + ["-ngl", "99", "-cmoe", "--moe-cache-mib", str(moe_mib), "--moe-cache-cpu-share", "0"] + dspark),
+        (f"cmoe_{moe_mib}_share0_nodraft", common + ["-ngl", "99", "-cmoe", "--moe-cache-mib", str(moe_mib), "--moe-cache-cpu-share", "0"]),
+        ("fit_on_nodraft", common),
+    ]
+
+
+def format_markdown(runs: list[dict]) -> str:
+    lines = ["### DeepSeek-V4.1-Flash-1017 (`llama.cpp`) Benchmark", ""]
+    lines.append("| Config | Cold Decode | Warm Decode (median) | Warm Prefill (median) | Long Prefill | Post-Long Decode | Draft Acc (warm med) | MoE Decode Hit |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    for run in runs:
+        cases = run["cases"]
+        cold = [c for c in cases if c["stage"] == "cold"]
+        warm = [c for c in cases if c["stage"] == "warm"]
+        lng = [c for c in cases if c["stage"] == "long"]
+        cold_s = f"{cold[0]['gen_tps']:.2f} t/s" if cold else "-"
+        warm_dec = f"{statistics.median(c['gen_tps'] for c in warm):.2f} t/s" if warm else "-"
+        warm_pre = f"{statistics.median(c['prompt_tps'] for c in warm):.2f} t/s" if warm else "-"
+        lng_pre = ", ".join(f"{c['prompt_n']}t @ {c['prompt_tps']:.1f}" for c in lng) if lng else "-"
+        lng_dec = ", ".join(f"{c['gen_tps']:.2f}" for c in lng) if lng else "-"
+        accs = [c["draft_acc_pct"] for c in warm if c["draft_acc_pct"] is not None]
+        acc_s = f"{statistics.median(accs):.1f}%" if accs else "n/a"
+        hit_s = f"{run.get('moe_cache', {}).get('decode', {}).get('hit_rate_pct'):.2f}%" if run.get("moe_cache", {}).get("decode") else "-"
+        lines.append(f"| `{run['label']}` | {cold_s} | **{warm_dec}** | {warm_pre} | {lng_pre} | {lng_dec} t/s | {acc_s} | {hit_s} |")
+    lines.append("")
+    for run in runs:
+        lines.append(f"<details><summary>{run['label']} per-prompt breakdown</summary>\n")
+        lines.append("| Stage | Prompt | Prompt Tok | Prefill t/s | Gen Tok | Decode t/s | Draft Acc |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|")
+        for c in run["cases"]:
+            acc = f"{c['draft_acc_pct']:.1f}%" if c["draft_acc_pct"] is not None else "n/a"
+            lines.append(f"| {c['stage']} | `{c['name']}` | {c['prompt_n']} | {c['prompt_tps']:.2f} | {c['gen_n']} | {c['gen_tps']:.2f} | {acc} |")
+        lines.append("\n</details>\n")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Reproducible benchmark for llama-server.")
+    ap.add_argument("--url", help="Benchmark an already-running llama-server (e.g. http://127.0.0.1:8000)")
+    ap.add_argument("--suite", choices=["deepseek-ab"], help="Run managed server A/B comparison suite")
+    ap.add_argument("--port", type=int, default=8010, help="Port for managed suite (default: 8010)")
+    ap.add_argument("--ctx", type=int, default=524288, help="Context size for deepseek-ab (default: 524288)")
+    ap.add_argument("--moe-mib", type=int, default=68000, help="MoE cache size in MiB (default: 68000)")
+    ap.add_argument("--max-tokens", type=int, default=512, help="Tokens to generate per prompt (default: 512)")
+    ap.add_argument("--temp", type=float, default=0.0, help="Sampling temperature (default: 0.0)")
+    ap.add_argument("--seed", type=int, default=42, help="Seed (default: 42)")
+    ap.add_argument("--long-words", type=int, nargs="*", default=[5500, 11000], help="Word counts for long prompts (~8k, ~16k tokens)")
+    ap.add_argument("--out-json", type=Path, help="Optional path to save raw JSON results")
+    ap.add_argument("--out-md", type=Path, help="Optional path to save Markdown summary")
+    ap.add_argument("--force", action="store_true", help="Allow running even if --url server has active requests")
+    args = ap.parse_args()
+
+    if not args.url and not args.suite:
+        ap.error("Specify either --url or --suite")
+
+    runs = []
+    if args.url:
+        base_url = args.url.rstrip("/")
+        check_idle(base_url, args.force)
+        print(f"Running benchmark against {base_url} ...", file=sys.stderr)
+        res = run_suite_against_url(base_url, args.max_tokens, args.temp, args.seed, args.long_words)
+        runs.append({"label": base_url, **res})
+    else:
+        existing = subprocess.run(["pgrep", "-x", "llama-server"], capture_output=True, text=True).stdout.strip()
+        if existing:
+            sys.exit(f"A llama-server is already running (PID(s): {existing}). Stop it with `llm-serve --stop` before running --suite.")
+        base_url = f"http://127.0.0.1:{args.port}"
+        with tempfile.TemporaryDirectory(prefix="llm-bench-") as tmpdir:
+            for label, cmd_args in deepseek_configs(args.ctx, args.moe_mib):
+                log_path = Path(tmpdir) / f"{label}.log"
+                cmd = [str(LLAMA_BIN)] + cmd_args + ["--host", "127.0.0.1", "--port", str(args.port)]
+                print(f"\n=== Starting {label} ===", file=sys.stderr)
+                with log_path.open("w") as lf:
+                    proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+                try:
+                    wait_for_health(proc, base_url, log_path)
+                    res = run_suite_against_url(base_url, args.max_tokens, args.temp, args.seed, args.long_words)
+                finally:
+                    proc.send_signal(signal.SIGINT)
+                    try:
+                        proc.wait(timeout=120)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                moe_stats = parse_moe_cache_stats(log_path.read_text(errors="replace"))
+                runs.append({"label": label, "moe_cache": moe_stats, **res})
+
+    md = format_markdown(runs)
+    print(md)
+    if args.out_md:
+        args.out_md.write_text(md)
+    if args.out_json:
+        args.out_json.write_text(json.dumps(runs, indent=2))
+
+
+if __name__ == "__main__":
+    main()

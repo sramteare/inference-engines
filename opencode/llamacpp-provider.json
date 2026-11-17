@@ -1,0 +1,38 @@
+{
+  "provider": {
+    "llamacpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama.cpp (Local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "sk-local",
+        "headerTimeout": 600000,
+        "chunkTimeout": 300000
+      },
+      "models": {
+        "qwen3.8-flash-next": {
+          "id": "qwen3.8-flash-next",
+          "name": "Qwen3.8-Flash-Next (UD-Q4_K_XL)",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": true,
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        },
+        "deepseek-v4.1-flash": {
+          "id": "deepseek-v4.1-flash",
+          "name": "DeepSeek-V4.1-Flash-1017 (UD-Q2_K_XL)",
+          "tool_call": true,
+          "reasoning": true,
+          "temperature": true,
+          "limit": {
+            "context": 524288,
+            "output": 32768
+          }
+        }
+      }
+    }
+  }
+}
