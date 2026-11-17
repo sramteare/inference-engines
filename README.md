@@ -76,3 +76,7 @@ llm-bench --suite deepseek-ab        # managed A/B: -fit on vs -cmoe --moe-cache
 Record with each result the llama.cpp ref (`git -C llama.cpp describe --tags`),
 the profile and any flags that differ from `llm-serve`, so a speedup can be
 traced to a launch flag or a rebuild.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
