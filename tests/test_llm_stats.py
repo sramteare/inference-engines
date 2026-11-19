@@ -219,7 +219,8 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("42 tok", gen[0])
 
     def test_reading_prefill_shows_now_rate_and_in_flight(self):
-        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 12000, "prompt_total": 40000}
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 12000,
+                "prompt_total": 40000, "prompt_tokens": 40000}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
@@ -229,6 +230,51 @@ class LlmStatsMayaTest(unittest.TestCase):
         gen = rate_line(out.stdout, "Generate")
         self.assertTrue(gen.startswith("Generate   last "), gen)   # first column stays "last"
         self.assertNotIn("now", gen)
+
+    def test_reading_in_flight_counts_only_fresh_tokens(self):
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 100000,
+                "prompt_read": 100500, "prompt_total": 102000, "prompt_tokens": 102000}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIn("now ", pre)
+        self.assertIn("+500/2000 in flight", pre)
+
+    def test_reading_stale_prompt_falls_back_to_idle_prefill_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Prefill")
+        for ptk in [None, 3000]:   # prompt_tokens not set yet, or prompt_total is the previous request's
+            live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 12000,
+                    "prompt_total": 40000, "prompt_tokens": ptk}
+            out = run_stats(self.serve(live=live))
+            self.assertEqual(out.returncode, 0, f"prompt_tokens={ptk!r}\n{out.stderr}")
+            line = rate_line(out.stdout, "Prefill")
+            self.assertEqual(line, base)   # byte-identical to the idle run
+            self.assertIn("last ", line)
+            self.assertNotIn("in flight", line)
+
+    def test_reading_bad_prefill_rate_falls_back_to_idle_prefill_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Prefill")
+        for raw in ["null", "NaN", "true", "10" + "0" * 29]:   # raw text: NaN survives the JSON round trip
+            body = ('{"live": {"state": "reading", "prefill_tok_s_mean": %s, "prompt_read": 12000, '
+                    '"prompt_total": 40000, "prompt_tokens": 40000}}' % raw)
+            out = run_stats(self.serve(metrics_body=body))
+            self.assertEqual(out.returncode, 0, f"raw={raw}\n{out.stdout}\n{out.stderr}")
+            line = rate_line(out.stdout, "Prefill")
+            self.assertEqual(line, base)
+            self.assertNotIn("in flight", line)
+
+    def test_reading_missing_prompt_read_shows_now_without_in_flight(self):
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_total": 40000, "prompt_tokens": 40000}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIn("now ", pre)
+        self.assertIn("1234.5", pre)
+        self.assertNotIn("in flight", pre)
 
     def test_generating_generate_shows_now_rate_and_in_flight(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": 412}
@@ -242,6 +288,32 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertTrue(pre.startswith("Prefill    last "), pre)
         self.assertNotIn("in flight", pre)
 
+    def test_generating_generate_line_exact_format(self):
+        live = {"state": "generating", "tok_s": 31.2, "generated": 412}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(rate_line(out.stdout, "Generate"),
+                         "Generate   now      31.2 tok/s   avg        - tok/s   (- tok, +412 in flight)")
+
+    def test_generating_prefill_shows_mean_as_now(self):
+        # prefill_tok_s_mean stays set for the whole request: show it, not the previous request's "last"
+        live = {"state": "generating", "tok_s": 31.2, "generated": 412, "prefill_tok_s_mean": 1500.0}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIn("now ", pre)
+        self.assertIn("1500.0", pre)
+        self.assertNotIn("in flight", pre)
+
+    def test_generating_missing_generated_shows_now_without_in_flight(self):
+        live = {"state": "generating", "tok_s": 31.2}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        gen = rate_line(out.stdout, "Generate")
+        self.assertIn("now ", gen)
+        self.assertIn("31.2", gen)
+        self.assertNotIn("in flight", gen)
+
     def test_idle_prefill_generate_use_last(self):
         out = run_stats(self.serve(live={"state": "idle"}))
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -249,6 +321,14 @@ class LlmStatsMayaTest(unittest.TestCase):
             line = rate_line(out.stdout, prefix)
             self.assertNotIn("now", line)
             self.assertNotIn("in flight", line)
+
+    def test_unloaded_prefill_generate_use_last(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        out = run_stats(self.serve(live={"state": "unloaded"}))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for prefix in ("Prefill", "Generate"):
+            self.assertEqual(rate_line(out.stdout, prefix), rate_line(idle.stdout, prefix))
 
     def test_generating_bad_tok_s_falls_back_to_idle_generate_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -310,6 +390,12 @@ class LlmStatsHeaderTest(unittest.TestCase):
     GOLDEN = {"basalt": "Basalt @ http://127.0.0.1:{port}   model: basalt-test   ctx: 8192"
                           "   basalt 0.4.1, Q4_K_XL, kv fp16",
               "llamacpp": "llama.cpp @ http://127.0.0.1:{port}   model: llama-test   ctx: 4096"}
+    GOLDEN_RATES = {
+        "basalt": {"Prefill": "Prefill    last        - tok/s   avg   1520.0 tok/s   (3800 tok, 1200 cached)",
+                   "Generate": "Generate   last        - tok/s   avg     60.0 tok/s   (900 tok)"},
+        "llamacpp": {"Prefill": "Prefill    last        - tok/s   avg   2000.0 tok/s   (5000 tok, - cached)",
+                     "Generate": "Generate   last        - tok/s   avg     60.0 tok/s   (900 tok)"},
+    }
 
     def assert_header_unchanged(self, handler, golden):
         server = serve(handler)
@@ -330,6 +416,16 @@ class LlmStatsHeaderTest(unittest.TestCase):
         out = self.assert_header_unchanged(LlamaCppHandler, self.GOLDEN["llamacpp"])
         self.assertIn("llama.cpp", out.stdout)
         self.assertNotIn("Live", out.stdout)
+
+    def test_basalt_rate_lines_unchanged(self):
+        out = self.assert_header_unchanged(BasaltHandler, self.GOLDEN["basalt"])
+        for prefix, golden in self.GOLDEN_RATES["basalt"].items():
+            self.assertEqual(rate_line(out.stdout, prefix), golden)
+
+    def test_llamacpp_rate_lines_unchanged(self):
+        out = self.assert_header_unchanged(LlamaCppHandler, self.GOLDEN["llamacpp"])
+        for prefix, golden in self.GOLDEN_RATES["llamacpp"].items():
+            self.assertEqual(rate_line(out.stdout, prefix), golden)
 
 
 if __name__ == "__main__":
