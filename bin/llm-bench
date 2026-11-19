@@ -13,6 +13,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -81,12 +82,26 @@ def read_metrics(base_url: str) -> dict[str, float]:
     return out
 
 
+def read_slots(base_url: str) -> list:
+    with urllib.request.urlopen(base_url + "/slots", timeout=5) as resp:
+        data = json.loads(resp.read().decode())
+    return data if isinstance(data, list) else [data]
+
+
 def check_idle(base_url: str, force: bool) -> None:
+    busy = None
     try:
         m = read_metrics(base_url)
+        if m:
+            busy = int(m.get("requests_processing", 0)) + int(m.get("requests_deferred", 0))
     except Exception:
-        return
-    busy = int(m.get("requests_processing", 0)) + int(m.get("requests_deferred", 0))
+        pass
+    if busy is None:
+        try:
+            busy = sum(1 for s in read_slots(base_url) if isinstance(s, dict) and s.get("is_processing"))
+        except Exception:
+            print(f"warning: {base_url} exposes neither /metrics nor /slots; cannot check whether it is busy.", file=sys.stderr)
+            return
     if busy > 0 and not force:
         sys.exit(f"Refusing to run: {base_url} currently has {busy} active/queued request(s). Pass --force to override.")
 
@@ -116,15 +131,24 @@ def run_chat_case(base_url: str, name: str, content: str, max_tokens: int, temp:
 
     return {
         "name": name,
-        "prompt_n": timings.get("prompt_n", 0),
-        "prompt_tps": timings.get("prompt_per_second", 0.0),
-        "prompt_ms": timings.get("prompt_ms", 0.0),
-        "gen_n": timings.get("predicted_n", 0),
-        "gen_tps": timings.get("predicted_per_second", 0.0),
-        "gen_ms": timings.get("predicted_ms", 0.0),
+        "prompt_n": timings.get("prompt_n"),
+        "prompt_tps": timings.get("prompt_per_second"),
+        "prompt_ms": timings.get("prompt_ms"),
+        "gen_n": timings.get("predicted_n"),
+        "gen_tps": timings.get("predicted_per_second"),
+        "gen_ms": timings.get("predicted_ms"),
         "wall_s": wall_s,
         "draft_acc_pct": acc_pct,
     }
+
+
+def fmt(value, spec: str, unit: str = "") -> str:
+    return "-" if value is None else f"{value:{spec}}{unit}"
+
+
+def median_or_none(values) -> float | None:
+    vals = [v for v in values if v is not None]
+    return statistics.median(vals) if vals else None
 
 
 def wait_for_health(proc: subprocess.Popen, base_url: str, log_path: Path) -> None:
@@ -157,7 +181,56 @@ def parse_moe_cache_stats(log_text: str) -> dict:
     return stats
 
 
-def run_suite_against_url(base_url: str, max_tokens: int, temp: float, seed: int, long_words: list[int]) -> dict:
+def run_concurrent_stage(base_url: str, max_tokens: int, temp: float, seed: int, concurrency: int) -> tuple[dict, list[dict]]:
+    pool = SHORT_PROMPTS[1:]
+    jobs = []
+    for i in range(concurrency):
+        name, content = pool[i % len(pool)]
+        jobs.append((f"{name}_{i + 1}", content))
+
+    results: list[dict | None] = [None] * concurrency
+    failures: list[Exception] = []
+    m_before = read_metrics(base_url)
+    t0 = time.monotonic()
+
+    def run_one(idx: int, name: str, content: str) -> None:
+        try:
+            results[idx] = run_chat_case(base_url, name, content, max_tokens, temp, seed)
+        except Exception as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=run_one, args=(i, name, content)) for i, (name, content) in enumerate(jobs)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    wall_s = time.monotonic() - t0
+    m_after = read_metrics(base_url)
+    if failures:
+        raise failures[0]
+
+    cases = [case for case in results if case is not None]
+    drafts = m_after.get("spec_decode_num_draft_tokens_total", 0.0) - m_before.get("spec_decode_num_draft_tokens_total", 0.0)
+    accepted = m_after.get("spec_decode_num_accepted_tokens_total", 0.0) - m_before.get("spec_decode_num_accepted_tokens_total", 0.0)
+    acc_pct = (100.0 * accepted / drafts) if drafts > 0 else None
+    for case in cases:
+        case["draft_acc_pct"] = None
+
+    gen_n = sum(case["gen_n"] or 0 for case in cases)
+    batch = {
+        "n_requests": concurrency,
+        "wall_s": wall_s,
+        "gen_n": gen_n,
+        "gen_tps": (gen_n / wall_s) if wall_s > 0 else 0.0,
+        "median_gen_tps": median_or_none(case["gen_tps"] for case in cases),
+        "draft_acc_pct": acc_pct,
+    }
+    return batch, cases
+
+
+def run_suite_against_url(
+    base_url: str, max_tokens: int, temp: float, seed: int, long_words: list[int], concurrency: int = 1
+) -> dict:
     results = []
     # Stage 1: Cold request (first request on fresh server)
     cold_name, cold_prompt = SHORT_PROMPTS[0]
@@ -169,7 +242,12 @@ def run_suite_against_url(base_url: str, max_tokens: int, temp: float, seed: int
     for words in long_words:
         lp = build_long_prompt(words)
         results.append(("long", run_chat_case(base_url, f"long_{words}w", lp, max_tokens, temp, seed)))
-    return {"cases": [{"stage": st, **r} for st, r in results]}
+    out = {"cases": [{"stage": st, **r} for st, r in results]}
+    if concurrency > 1:
+        batch, concurrent_cases = run_concurrent_stage(base_url, max_tokens, temp, seed, concurrency)
+        out["concurrent"] = batch
+        out["cases"].extend({"stage": "concurrent", **case} for case in concurrent_cases)
+    return out
 
 
 def deepseek_configs(ctx: int, moe_mib: int) -> list[tuple[str, list[str]]]:
@@ -185,34 +263,93 @@ def deepseek_configs(ctx: int, moe_mib: int) -> list[tuple[str, list[str]]]:
     ]
 
 
-def format_markdown(runs: list[dict]) -> str:
-    lines = ["### DeepSeek-V4.1-Flash-1017 (`llama.cpp`) Benchmark", ""]
-    lines.append("| Config | Cold Decode | Warm Decode (median) | Warm Prefill (median) | Long Prefill | Post-Long Decode | Draft Acc (warm med) | MoE Decode Hit |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+SUMMARY_HEADER = (
+    "| Config | Cold Decode | Warm Decode (median) | Warm Prefill (median) | Long Prefill | Post-Long Decode "
+    "| Conc. agg gen | Conc. per-req gen (median) | Draft Acc (warm med) | MoE Decode Hit |"
+)
+SUMMARY_SEPARATOR = "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+
+
+def markdown_summary_rows(runs: list[dict]) -> list[str]:
+    rows = []
     for run in runs:
         cases = run["cases"]
         cold = [c for c in cases if c["stage"] == "cold"]
         warm = [c for c in cases if c["stage"] == "warm"]
         lng = [c for c in cases if c["stage"] == "long"]
-        cold_s = f"{cold[0]['gen_tps']:.2f} t/s" if cold else "-"
-        warm_dec = f"{statistics.median(c['gen_tps'] for c in warm):.2f} t/s" if warm else "-"
-        warm_pre = f"{statistics.median(c['prompt_tps'] for c in warm):.2f} t/s" if warm else "-"
-        lng_pre = ", ".join(f"{c['prompt_n']}t @ {c['prompt_tps']:.1f}" for c in lng) if lng else "-"
-        lng_dec = ", ".join(f"{c['gen_tps']:.2f}" for c in lng) if lng else "-"
+        cold_s = fmt(cold[0]["gen_tps"], ".2f", " t/s") if cold else "-"
+        warm_dec = fmt(median_or_none(c["gen_tps"] for c in warm), ".2f", " t/s")
+        warm_pre = fmt(median_or_none(c["prompt_tps"] for c in warm), ".2f", " t/s")
+        lng_pre = ", ".join(f"{fmt(c['prompt_n'], '.0f')}t @ {fmt(c['prompt_tps'], '.1f')}" for c in lng) if lng else "-"
+        lng_dec = ", ".join(fmt(c["gen_tps"], ".2f") for c in lng) if lng else "-"
+        conc = run.get("concurrent")
+        conc_agg = fmt(conc["gen_tps"], ".2f", " t/s") if conc else "-"
+        conc_med = fmt(conc["median_gen_tps"], ".2f", " t/s") if conc else "-"
         accs = [c["draft_acc_pct"] for c in warm if c["draft_acc_pct"] is not None]
         acc_s = f"{statistics.median(accs):.1f}%" if accs else "n/a"
-        hit_s = f"{run.get('moe_cache', {}).get('decode', {}).get('hit_rate_pct'):.2f}%" if run.get("moe_cache", {}).get("decode") else "-"
-        lines.append(f"| `{run['label']}` | {cold_s} | **{warm_dec}** | {warm_pre} | {lng_pre} | {lng_dec} t/s | {acc_s} | {hit_s} |")
-    lines.append("")
+        hit = run.get("moe_cache", {}).get("decode", {}).get("hit_rate_pct")
+        hit_s = fmt(hit, ".2f", "%") if hit is not None else "-"
+        rows.append(
+            f"| `{run['label']}` | {cold_s} | **{warm_dec}** | {warm_pre} | {lng_pre} | {lng_dec} t/s "
+            f"| {conc_agg} | {conc_med} | {acc_s} | {hit_s} |"
+        )
+    return rows
+
+
+def markdown_details(runs: list[dict]) -> list[str]:
+    lines = []
     for run in runs:
         lines.append(f"<details><summary>{run['label']} per-prompt breakdown</summary>\n")
         lines.append("| Stage | Prompt | Prompt Tok | Prefill t/s | Gen Tok | Decode t/s | Draft Acc |")
         lines.append("|---|---|---:|---:|---:|---:|---:|")
         for c in run["cases"]:
             acc = f"{c['draft_acc_pct']:.1f}%" if c["draft_acc_pct"] is not None else "n/a"
-            lines.append(f"| {c['stage']} | `{c['name']}` | {c['prompt_n']} | {c['prompt_tps']:.2f} | {c['gen_n']} | {c['gen_tps']:.2f} | {acc} |")
+            lines.append(f"| {c['stage']} | `{c['name']}` | {fmt(c['prompt_n'], '.0f')} | {fmt(c['prompt_tps'], '.2f')} | {fmt(c['gen_n'], '.0f')} | {fmt(c['gen_tps'], '.2f')} | {acc} |")
+        conc = run.get("concurrent")
+        if conc:
+            acc = f"{conc['draft_acc_pct']:.1f}%" if conc["draft_acc_pct"] is not None else "n/a"
+            lines.append(
+                f"\nConcurrent batch ({conc['n_requests']} requests): wall {conc['wall_s']:.2f} s, "
+                f"{conc['gen_n']} tokens, {fmt(conc['gen_tps'], '.2f')} t/s aggregate, "
+                f"{fmt(conc['median_gen_tps'], '.2f')} t/s per-request median, draft acc {acc}."
+            )
         lines.append("\n</details>\n")
+    return lines
+
+
+def format_markdown(runs: list[dict]) -> str:
+    lines = ["### llama-server benchmark", "", SUMMARY_HEADER, SUMMARY_SEPARATOR]
+    lines.extend(markdown_summary_rows(runs))
+    lines.append("")
+    lines.extend(markdown_details(runs))
     return "\n".join(lines)
+
+
+def append_markdown(path: Path, runs: list[dict]) -> None:
+    rows = markdown_summary_rows(runs)
+    details = markdown_details(runs)
+    if not path.exists() or not path.read_text().strip():
+        lines = ["### llama-server benchmark", "", SUMMARY_HEADER, SUMMARY_SEPARATOR]
+        lines.extend(rows)
+        lines.append("")
+        lines.extend(details)
+        path.write_text("\n".join(lines) + "\n")
+        return
+    lines = path.read_text().splitlines()
+    start = next(
+        (i for i, line in enumerate(lines)
+         if line.startswith("| Config |") and line.count("|") == SUMMARY_HEADER.count("|")),
+        None,
+    )
+    if start is None:  # no table yet, or an existing header has a different column count
+        lines.extend(["", "### llama-server benchmark", "", SUMMARY_HEADER, SUMMARY_SEPARATOR, *rows, "", *details])
+    else:
+        end = start + 2
+        while end < len(lines) and lines[end].startswith("|"):
+            end += 1
+        lines[end:end] = rows
+        lines.extend([""] + details)
+    path.write_text("\n".join(lines) + "\n")
 
 
 def main() -> None:
@@ -226,25 +363,35 @@ def main() -> None:
     ap.add_argument("--temp", type=float, default=0.0, help="Sampling temperature (default: 0.0)")
     ap.add_argument("--seed", type=int, default=42, help="Seed (default: 42)")
     ap.add_argument("--long-words", type=int, nargs="*", default=[5500, 11000], help="Word counts for long prompts (~8k, ~16k tokens)")
+    ap.add_argument("--concurrency", type=int, default=1, help="Send this many chat requests simultaneously and add a 'concurrent' stage (default: 1)")
+    ap.add_argument("--label", help="Label for this run in Markdown/JSON instead of the URL")
     ap.add_argument("--out-json", type=Path, help="Optional path to save raw JSON results")
     ap.add_argument("--out-md", type=Path, help="Optional path to save Markdown summary")
+    ap.add_argument("--append-md", type=Path, help="Append this run's table row and details to an existing Markdown file")
     ap.add_argument("--force", action="store_true", help="Allow running even if --url server has active requests")
     args = ap.parse_args()
 
     if not args.url and not args.suite:
         ap.error("Specify either --url or --suite")
+    if args.concurrency < 1:
+        ap.error("--concurrency must be >= 1")
 
     runs = []
     if args.url:
         base_url = args.url.rstrip("/")
         check_idle(base_url, args.force)
         print(f"Running benchmark against {base_url} ...", file=sys.stderr)
-        res = run_suite_against_url(base_url, args.max_tokens, args.temp, args.seed, args.long_words)
-        runs.append({"label": base_url, **res})
+        res = run_suite_against_url(base_url, args.max_tokens, args.temp, args.seed, args.long_words, args.concurrency)
+        runs.append({"label": args.label or base_url, **res})
     else:
-        existing = subprocess.run(["pgrep", "-x", "llama-server"], capture_output=True, text=True).stdout.strip()
-        if existing:
-            sys.exit(f"A llama-server is already running (PID(s): {existing}). Stop it with `llm-serve --stop` before running --suite.")
+        guards = (("llama-server", ["pgrep", "-x", "llama-server"]),
+                  ("basalt", ["pgrep", "-x", "basalt"]),
+                  ("maya.py", ["pgrep", "-f", "maya.py"]))
+        found = {name: subprocess.run(args, capture_output=True, text=True).stdout.strip() for name, args in guards}
+        found = {name: pids for name, pids in found.items() if pids}
+        if found:
+            listing = ", ".join(f"{name} (PID(s): {pids})" for name, pids in found.items())
+            sys.exit(f"A server is already running: {listing}. Stop it with `llm-serve --stop` before running --suite.")
         base_url = f"http://127.0.0.1:{args.port}"
         with tempfile.TemporaryDirectory(prefix="llm-bench-") as tmpdir:
             for label, cmd_args in deepseek_configs(args.ctx, args.moe_mib):
@@ -255,7 +402,9 @@ def main() -> None:
                     proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
                 try:
                     wait_for_health(proc, base_url, log_path)
-                    res = run_suite_against_url(base_url, args.max_tokens, args.temp, args.seed, args.long_words)
+                    res = run_suite_against_url(
+                        base_url, args.max_tokens, args.temp, args.seed, args.long_words, args.concurrency
+                    )
                 finally:
                     proc.send_signal(signal.SIGINT)
                     try:
@@ -265,12 +414,14 @@ def main() -> None:
                 moe_stats = parse_moe_cache_stats(log_path.read_text(errors="replace"))
                 runs.append({"label": label, "moe_cache": moe_stats, **res})
 
+    if args.out_json:
+        args.out_json.write_text(json.dumps(runs, indent=2))
     md = format_markdown(runs)
     print(md)
     if args.out_md:
         args.out_md.write_text(md)
-    if args.out_json:
-        args.out_json.write_text(json.dumps(runs, indent=2))
+    if args.append_md:
+        append_markdown(args.append_md, runs)
 
 
 if __name__ == "__main__":

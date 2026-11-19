@@ -1,5 +1,6 @@
 # Engines are rebuilt from build-llama.sh / setup-vllm.sh, not committed.
 /llama.cpp/
+/llama.cpp-*/
 /vllm-env/
 
 # Runtime output. Copy runs worth keeping into bench/results/.

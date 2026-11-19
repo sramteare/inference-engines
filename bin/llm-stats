@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""llm-stats - live dashboard for a running llama-server.
+"""llm-stats - live dashboard for a running llama.cpp, Basalt or Maya server.
 
-Usage: llm-stats [--port 8000] [--host localhost] [--interval 1] [--once]
+Usage: llm-stats [--port 8000] [--host localhost] [--interval 1] [--once] [--engine auto]
+--engine auto (default) detects the engine from /health and /v1/status.
 Requires llama-server started with --metrics (llm-serve does this).
 """
 import argparse, json, re, subprocess, sys, time, urllib.request
@@ -11,8 +12,11 @@ p.add_argument("--host", default="localhost")
 p.add_argument("--port", type=int, default=8000)
 p.add_argument("--interval", type=float, default=1.0)
 p.add_argument("--once", action="store_true")
+p.add_argument("--engine", choices=["auto", "llamacpp", "basalt", "maya"], default="auto")
 a = p.parse_args()
 BASE = f"http://{a.host}:{a.port}"
+NAMES = {"llamacpp": "llama.cpp", "basalt": "Basalt", "maya": "Maya"}
+ENGINE = None if a.engine == "auto" else a.engine  # None = not detected yet
 
 
 def get(path, as_json=True):
@@ -21,13 +25,82 @@ def get(path, as_json=True):
     return json.loads(body) if as_json else body
 
 
-def metrics():
+def detect():
+    """Engine id from the server's own reports, or None when unreachable."""
+    ok = False
+    try:
+        if get("/health").get("service") == "basalt":
+            return "basalt"
+        ok = True
+    except Exception:
+        pass
+    try:
+        if get("/v1/status").get("service") == "maya":
+            return "maya"
+        ok = True
+    except Exception:
+        pass
+    return "llamacpp" if ok else None
+
+
+def prom_metrics(path):
     out = {}
-    for line in get("/metrics", as_json=False).splitlines():
+    for line in get(path, as_json=False).splitlines():
         m = re.match(r"^llamacpp:(\w+)(?:\{[^}]*\})?\s+([-\d.eE+naNinf]+)$", line)
         if m:
             out[m.group(1)] = float(m.group(2))
     return out
+
+
+def basalt_metrics():
+    """Basalt's JSON /metrics mapped onto the llama.cpp counter names."""
+    j = get("/metrics")
+    t, live = j.get("totals") or {}, j.get("live") or {}
+    slots = live.get("slots") or {}
+    m, prompt, reused = {}, t.get("prompt"), t.get("reused")
+    if prompt is not None:
+        m["prompt_tokens_total"] = prompt - (reused or 0)
+    if reused is not None:
+        m["prompt_tokens_cached_total"] = reused
+    if t.get("prompt_ms") is not None:
+        m["prompt_seconds_total"] = t["prompt_ms"] / 1000
+    if t.get("written") is not None:
+        m["tokens_predicted_total"] = t["written"]
+    if t.get("decode_ms") is not None:
+        m["tokens_predicted_seconds_total"] = t["decode_ms"] / 1000
+    if slots.get("active") is not None:
+        m["requests_processing"] = slots["active"]
+    if live.get("queued") is not None:
+        m["requests_deferred"] = live["queued"]
+    return m, j
+
+
+def metrics():
+    """(llama.cpp-style counters, engine info or None)."""
+    if ENGINE == "basalt":
+        return basalt_metrics()
+    if ENGINE == "maya":
+        return prom_metrics("/metrics/prometheus"), None   # Maya's Prometheus text
+    return prom_metrics("/metrics"), None
+
+
+def server_info():
+    """(model, ctx) from /v1/models, falling back to /props."""
+    model, ctx = "?", None
+    try:
+        d = (get("/v1/models").get("data") or [{}])[0]
+        model = d.get("id") or model
+        ctx = (d.get("meta") or {}).get("n_ctx") or d.get("context_length")
+    except Exception:
+        pass
+    try:
+        props = get("/props")
+        if model == "?":
+            model = props.get("model_alias") or props.get("model_path", "?").rsplit("/", 1)[-1]
+        ctx = ctx or (props.get("default_generation_settings") or {}).get("n_ctx")
+    except Exception:
+        pass
+    return model, ctx
 
 
 def gpu():
@@ -51,9 +124,11 @@ PREV = {}
 
 
 def rate(m, tok_key, sec_key):
-    """(last, average) tok/s. last = most recently finished request(s); sticky."""
-    tok, sec = m.get(tok_key, 0.0), m.get(sec_key, 0.0)
-    avg = tok / sec if sec > 0 else 0.0
+    """(last, average) tok/s. last = most recently finished request(s); sticky. None = unknown."""
+    tok, sec = m.get(tok_key), m.get(sec_key)
+    if tok is None or sec is None:
+        return None, None
+    avg = tok / sec if sec > 0 else None   # no finished request yet: unknown, not 0
     if tok_key in PREV:
         dt, ds = tok - PREV[tok_key], sec - PREV[sec_key]
         if ds > 0:
@@ -64,56 +139,83 @@ def rate(m, tok_key, sec_key):
 
 def fmt_rate(live, avg):
     l = f"{live:8.1f}" if live is not None else "       -"
-    return f"last {l} tok/s   avg {avg:8.1f} tok/s"
+    v = f"{avg:8.1f}" if avg is not None else "       -"
+    return f"last {l} tok/s   avg {v} tok/s"
+
+
+def num(v):
+    return f"{int(v)}" if v is not None else "-"
 
 
 def render():
-    lines = []
+    global ENGINE
+    if ENGINE is None:
+        ENGINE = detect()  # retried every frame until the server answers
     try:
-        props = get("/props")
-        model = props.get("model_alias") or props.get("model_path", "?").rsplit("/", 1)[-1]
-    except Exception:
-        model = "?"
-    try:
-        m = metrics()
+        m, eng = metrics()
     except Exception as e:
-        return f"Cannot reach {BASE}/metrics ({e}).\nIs llama-server running with --metrics?  (llm-serve)"
-
-    lines.append(f"llama-server @ {BASE}   model: {model}")
-    lines.append("-" * 72)
-    lines.append(f"Load       processing: {int(m.get('requests_processing', 0))}   "
-                 f"queued: {int(m.get('requests_deferred', 0))}")
-    lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"))
-                 + f"   ({int(m.get('prompt_tokens_total', 0))} tok, "
-                 f"{int(m.get('prompt_tokens_cached_total', 0))} cached)")
-    lines.append("Generate   " + fmt_rate(*rate(m, "tokens_predicted_total", "tokens_predicted_seconds_total"))
-                 + f"   ({int(m.get('tokens_predicted_total', 0))} tok)")
-    d = m.get("spec_decode_num_draft_tokens_total")
-    if d is not None:
-        acc = m.get("spec_decode_num_accepted_tokens_total", 0)
-        lines.append(f"MTP draft  accepted {int(acc)}/{int(d)}" + (f"  ({acc/d*100:.1f}%)" if d else ""))
-
+        hint = "\nIs llama-server running with --metrics?  (llm-serve)" if ENGINE in (None, "llamacpp") else ""
+        return f"Cannot reach {BASE} ({e}).{hint}"
+    model, ctx = server_info()
     try:
         slots = get("/slots")
-        now = time.monotonic()
-        for s in slots:
-            n_ctx = s.get("n_ctx", 0) or 1
+    except Exception:
+        slots = []
+    if ctx is None and slots:
+        ctx = slots[0].get("n_ctx")
+
+    lines = []
+    head = f"{NAMES.get(ENGINE) or 'llama.cpp'} @ {BASE}   model: {model}   ctx: {ctx if ctx else '-'}"
+    if ENGINE == "basalt":
+        e = (eng or {}).get("engine") or {}
+        extra = ", ".join(x for x in [f"basalt {e['version']}" if e.get("version") else "",
+                                      e.get("quant") or "", f"kv {e['kv']}" if e.get("kv") else ""] if x)
+        head += f"   {extra}" if extra else ""
+    lines.append(head)
+    lines.append("-" * 72)
+    lines.append(f"Load       processing: {num(m.get('requests_processing'))}   "
+                 f"queued: {num(m.get('requests_deferred'))}")
+    lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"))
+                 + f"   ({num(m.get('prompt_tokens_total'))} tok, "
+                 f"{num(m.get('prompt_tokens_cached_total'))} cached)")
+    lines.append("Generate   " + fmt_rate(*rate(m, "tokens_predicted_total", "tokens_predicted_seconds_total"))
+                 + f"   ({num(m.get('tokens_predicted_total'))} tok)")
+    if ENGINE == "basalt":
+        off = sum(s["drafts_offered"] for s in slots if s.get("drafts_offered") is not None)
+        acc = sum(s["drafts_accepted"] for s in slots if s.get("drafts_accepted") is not None)
+        if off or acc:
+            lines.append(f"Draft (last req) accepted {acc}/{off}" + (f"  ({acc/off*100:.1f}%)" if off else ""))
+    else:
+        d = m.get("spec_decode_num_draft_tokens_total")
+        if d is not None:
+            acc = m.get("spec_decode_num_accepted_tokens_total", 0)
+            lines.append(f"Draft      accepted {int(acc)}/{int(d)}" + (f"  ({acc/d*100:.1f}%)" if d else ""))
+
+    now = time.monotonic()
+    for s in slots:
+        sid = s.get("id", 0)
+        n_ctx = s.get("n_ctx", 0) or 1
+        state = "busy" if s.get("is_processing") else "idle"
+        if ENGINE == "maya":
+            lines.append(f"Slot {sid}     {state:<5} ctx {'-':>7}/{n_ctx}")   # Maya gives no used ctx
+            continue
+        if ENGINE == "basalt":
+            used = s.get("ctx_used", 0) or 0
+            ts = s.get("tok_s") or 0.0
+            live = f"  gen now {ts:6.1f} tok/s" if s.get("is_processing") and ts > 0 else ""
+        else:
             nt = s.get("next_token")
             nt = nt[0] if isinstance(nt, list) and nt else (nt or {})
             dec = nt.get("n_decoded", 0) or 0
             used = (s.get("n_prompt_tokens", 0) or 0) + dec
-            busy = s.get("is_processing")
-            key = f"slot{s.get('id', 0)}"
+            key = f"slot{sid}"
             live = ""
-            if busy and key in PREV:
+            if s.get("is_processing") and key in PREV:
                 pdec, pt = PREV[key]
                 if dec >= pdec and now > pt:
                     live = f"  gen now {(dec - pdec) / (now - pt):6.1f} tok/s"
             PREV[key] = (dec, now)
-            state = "busy" if busy else "idle"
-            lines.append(f"Slot {s.get('id', 0)}     {state:<5} ctx {used:>7}/{n_ctx}  {bar(used / n_ctx, 20)}{live}")
-    except Exception:
-        pass
+        lines.append(f"Slot {sid}     {state:<5} ctx {used:>7}/{n_ctx}  {bar(used / n_ctx, 20)}{live}")
 
     lines.append(gpu())
     lines.append("-" * 72)

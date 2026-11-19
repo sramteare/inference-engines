@@ -2,16 +2,42 @@
 # llm-serve - unified CLI to start, stop, and inspect local llama-server profiles.
 set -euo pipefail
 
+# Process helpers shared by --stop, --status and the launch path.
+proc_cmdline() {  # $1 pid -> space-joined cmdline
+  tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
+}
+is_our_cmd() {  # $1 pid -> 0 if its cmdline is one of our server binaries
+  local c
+  c="$(proc_cmdline "$1")" || return 1
+  case "$c" in
+    *llama-server*|*maya.py*|*basalt*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+starttime_of() {  # $1 pid -> start time (field 22 of /proc/<pid>/stat)
+  local stat rest
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  rest="${stat##*) }"   # drop through the comm field; remainder starts at field 3 (state)
+  set -- $rest          # original field N is now positional $((N - 2)), so 22 -> $20
+  printf '%s' "${20:-}"
+}
+
 main() {
   # Not `local`: that would hide the environment overrides documented below.
-  local ENGINES DAEMON
+  local ENGINES DAEMON RUN_CWD CONFIG CONFIG_TMP SYNC_ALIAS SYNC_CTX
   ENGINES="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
   MODELS="${MODELS:-$HOME/dev/models}"
   LLAMA_BIN="${LLAMA_BIN:-$ENGINES/llama.cpp/build/bin/llama-server}"
   LOG_DIR="${LOG_DIR:-$ENGINES/logs}"
+  HOST_SET="${HOST+1}"
   HOST="${HOST:-0.0.0.0}"
   PORT="${PORT:-8000}"
   SPEC="${SPEC:-1}"
+  VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-3072}"
+  DS_NONCACHE_MIB="${DS_NONCACHE_MIB:-23000}"
+  MOE_CPU_SHARE="${MOE_CPU_SHARE:-0.85}"
+  MAYA_DIR="${MAYA_DIR:-$HOME/dev/maya-src}"
+  BASALT_DIR="${BASALT_DIR:-$HOME/dev/basalt-src}"
   DAEMON=0
 
   usage() {
@@ -20,29 +46,43 @@ Usage:
   llm-serve [-d] [profile] [extra llama-server args...]
   llm-serve --status [--port N]       One-shot server & GPU status snapshot
   llm-serve --stats  [--port N ...]   Live terminal dashboard (Ctrl+C to exit)
-  llm-serve --stop   [port]           Stop running llama-server instance(s)
+  llm-serve --stop   [port]           Stop running server instance(s)
   llm-serve --list                    List available model profiles
   llm-serve -h | --help               Show this help message
 
 Profiles:
-  qwen      Qwen3.8-Flash-Next UD-Q4_K_XL + MTP Q8_0, 256k native ctx (default)
-  deepseek  DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL + DSpark Q8_0, 512k ctx
+  qwen      Qwen UD-Q4_K_XL on Basalt: faster, closer to BF16 (default)
+  deepseek  DeepSeek UD-Q2_K_XL on Project Maya: faithful to DeepSeek's reference, ~20x faster long prompts
+  qwen-llama      Qwen UD-Q4_K_XL + MTP Q8_0, 256k ctx, f16 KV, -fitt (llama.cpp fallback)
+  deepseek-llama  DeepSeek UD-Q2_K_XL + DSpark Q8_0, 512k ctx, GPU expert cache + CPU share (llama.cpp fallback)
+  qwen-basalt / deepseek-maya  aliases of qwen / deepseek
 
 Flags / Subcommands:
   -d                Run server in background (logs to $LOG_DIR/llama-<profile>.log)
   --status, status  Print current server status and metrics snapshot (--once)
   --stats,  stats   Launch live metrics dashboard (passes extra args to llm-stats)
-  --stop,   stop    Stop running llama-server (optionally filtered by port)
+  --stop,   stop    Stop running server(s): llama-server, Maya, Basalt (optionally filtered
+                    by port). Pid files are verified (start time + cmdline) before anything
+                    is signalled; servers are stopped by session, engine children included.
   --list,   list    List available profiles
   -h, --help, help  Show this help message
 
 Environment overrides:
-  SPEC=1|0    Enable (1, default) or disable (0) speculative decoding (MTP / DSpark)
-  CTX=N       Override context window size (default: 262144 qwen, 524288 deepseek)
-  PORT=N      Server port (default: 8000)
-  HOST=ADDR   Bind address (default: 0.0.0.0)
-  MODELS=DIR  Models root directory (default: ~/dev/models)
-  LOG_DIR=DIR Log directory (default: ~/dev/engines/logs)
+  SPEC=1|0           Enable (1, default) or disable (0) speculative decoding (MTP / DSpark)
+  CTX=N              Override context window size (default: 262144 qwen, 524288 deepseek)
+  PORT=N             Server port (default: 8000)
+  HOST=ADDR          Bind address (default: 0.0.0.0; 127.0.0.1 for qwen and deepseek, the Basalt/Maya profiles)
+  MODELS=DIR         Models root directory (default: ~/dev/models)
+  LOG_DIR=DIR        Log directory (default: ~/dev/engines/logs)
+  VRAM_RESERVE_MIB=N VRAM left free for the desktop, MiB (default: 3072)
+  MOE_CACHE_MIB=N    deepseek MoE cache size, MiB (default: free VRAM - reserve - other)
+  MOE_CPU_SHARE=F    deepseek share of MoE cache misses computed on CPU from RAM experts instead of uploaded to GPU (default: 0.85)
+  DS_NONCACHE_MIB=N  deepseek non-cache VRAM estimate for the cache calc, MiB (default: 23000)
+  MAYA_DIR=DIR       Project Maya engine directory (default: ~/dev/maya-src)
+  BASALT_DIR=DIR     Basalt engine directory (default: ~/dev/basalt-src)
+  DRY_RUN=1          Print the full launch command (plus the generated config for
+                     qwen / deepseek) and exit (no server, no opencode sync, nothing
+                     written to LOG_DIR)
 EOF
   }
 
@@ -50,40 +90,226 @@ EOF
     local target_port="${1:-}"
     find_pids() {
       if [[ -n "$target_port" ]]; then
-        pgrep -a -x llama-server | awk -v p="--port $target_port" 'index($0, p) {print $1}'
+        # exact --port argument match, not a substring of the whole command line
+        pgrep -a -x llama-server | awk -v p="$target_port" '
+          { for (i = 2; i <= NF; i++)
+              if (($i == "--port" && $(i + 1) == p) || $i == "--port=" p) { print $1; next } }'
       else
         pgrep -x llama-server
       fi
     }
-    local pids
+    stop_session() {  # returns 0 only if a signal was actually delivered
+      local sid="$1"
+      pkill -TERM -s "$sid" 2>/dev/null || return 1
+      for _ in {1..60}; do
+        pgrep -s "$sid" >/dev/null 2>&1 || return 0
+        sleep 0.5
+      done
+      pkill -KILL -s "$sid" 2>/dev/null || true
+    }
+    stop_pidfile() {
+      # "<pgid> <starttime>" (old files hold just "<pgid>"). Only signal once the
+      # group still belongs to one of our servers: recorded start time still
+      # matches /proc/<pgid>/stat (when recorded) AND the cmdline is ours.
+      # A failed check means the pid was recycled: drop the file, signal nothing.
+      local f="$1" pgid="" starttime=""
+      { read -r pgid starttime; } < "$f" || true
+      if [[ "$pgid" =~ ^[0-9]+$ ]] && is_our_cmd "$pgid" &&
+         { [[ -z "$starttime" ]] || [[ "$(starttime_of "$pgid" || true)" == "$starttime" ]]; }; then
+        if stop_session "$pgid"; then   # setsid at launch: pgid == sid
+          rm -f "$f"
+          return 0
+        fi
+      fi
+      rm -f "$f"
+      return 1
+    }
+    stop_listener() {
+      # a server found via its listening socket: stop the whole session when it
+      # leads one (setsid launch); otherwise the process alone.
+      local pid="$1" sid
+      sid="$(ps -o sess= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+      if [[ "$sid" == "$pid" ]]; then
+        stop_session "$sid"
+      else
+        kill -TERM "$pid" 2>/dev/null || return 1
+        for _ in {1..60}; do
+          kill -0 "$pid" 2>/dev/null || return 0
+          sleep 0.5
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+    }
+
+    local stopped=0 refused=0 f pids pid
+    if [[ -n "$target_port" ]]; then
+      if [[ -f "$LOG_DIR/serve-$target_port.pid" ]]; then
+        stop_pidfile "$LOG_DIR/serve-$target_port.pid" && stopped=1
+      else
+        pids="$(ss -ltnpH "sport = :$target_port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u || true)"
+        for pid in $pids; do
+          if is_our_cmd "$pid"; then
+            stop_listener "$pid" && stopped=1
+          else
+            refused=1
+            echo "Port $target_port is held by pid $pid: $(proc_cmdline "$pid" || echo 'unknown process') - not a server we manage, leaving it alone."
+          fi
+        done
+      fi
+    else
+      for f in "$LOG_DIR"/serve-*.pid; do
+        [[ -e "$f" ]] || continue
+        stop_pidfile "$f" && stopped=1
+      done
+      # Basalt/Maya servers without a pid file (e.g. started in the foreground).
+      local -a pids2=()
+      mapfile -t pids2 < <(ss -ltnpH 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -un || true)
+      for pid in "${pids2[@]}"; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        is_our_cmd "$pid" || continue
+        stop_listener "$pid" && stopped=1
+      done
+    fi
+
     pids="$(find_pids || true)"
     if [[ -n "$pids" ]]; then
+      stopped=1
       kill $pids 2>/dev/null || true
       for _ in {1..20}; do
-        [[ -z "$(find_pids || true)" ]] && { echo "Stopped."; return 0; }
+        [[ -z "$(find_pids || true)" ]] && break
         sleep 0.5
       done
       pids="$(find_pids || true)"
       [[ -n "$pids" ]] && { echo "Still running; forcing."; kill -9 $pids 2>/dev/null || true; }
+    fi
+
+    if [[ -n "$target_port" ]]; then
+      if (( refused && ! stopped )); then
+        echo "Port $target_port still in use (not one of our servers)." >&2
+        return 1
+      fi
+      for _ in {1..60}; do
+        ss -ltnH "sport = :$target_port" 2>/dev/null | grep -q . || break
+        sleep 0.5
+      done
+      if ss -ltnH "sport = :$target_port" 2>/dev/null | grep -q .; then
+        echo "Port $target_port still in use." >&2
+        return 1
+      fi
+    fi
+    if (( stopped )); then
+      echo "Stopped."
     else
-      echo "No llama-server running."
+      echo "No server running."
     fi
   }
 
   do_status() {
-    local pids
-    pids="$(pgrep -x llama-server || true)"
-    if [[ -z "$pids" ]]; then
-      echo "No llama-server running."
+    # --port N filters the servers to show; everything else goes to llm-stats.
+    local port_filter=""
+    local -a REST=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --port)
+          shift
+          if [[ $# -gt 0 ]]; then port_filter="$1"; shift; fi
+          ;;
+        --port=*) port_filter="${1#--port=}"; shift ;;
+        *) REST+=("$1"); shift ;;
+      esac
+    done
+
+    # Server pid plus the pids of its engine processes. Basalt runs bin/basalt
+    # in its own group but in the server's session (setsid at launch), so list
+    # the whole session when the pid leads one - the same set --stop signals.
+    group_pids() {
+      local pid="$1" kids sid
+      sid="$(ps -o sess= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+      if [[ "$sid" == "$pid" ]]; then
+        printf '%s' "$(pgrep -s "$pid" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+      elif kill -0 "$pid" 2>/dev/null; then
+        kids="$(pgrep -P "$pid" 2>/dev/null | tr '\n' ',' || true)"
+        printf '%s' "$pid${kids:+,${kids%,}}"
+      else
+        printf '%s' "$(pgrep -s "$pid" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)"
+      fi
+    }
+
+    # One entry per running server: pid files first (process groups), then any
+    # server found by its listening socket (no pid file, e.g. started in the
+    # foreground) that is not already covered by one of those groups.
+    local -a TARGETS=() PORTS=() CMDS=()
+    local group_pgids="" seen_pids="" f pgid starttime port pid cmd
+    for f in "$LOG_DIR"/serve-*.pid; do
+      [[ -e "$f" ]] || continue
+      pgid=""; starttime=""
+      { read -r pgid starttime; } < "$f" || true
+      [[ "$pgid" =~ ^[0-9]+$ ]] || continue
+      # a recycled pid must not masquerade as our server (same checks as --stop)
+      is_our_cmd "$pgid" || continue
+      [[ -z "$starttime" || "$(starttime_of "$pgid" || true)" == "$starttime" ]] || continue
+      kill -0 -- "-$pgid" 2>/dev/null || continue
+      group_pgids="$group_pgids $pgid"
+      port="$(basename "$f" .pid)"
+      port="${port#serve-}"
+      [[ -z "$port_filter" || "$port" == "$port_filter" ]] || continue
+      TARGETS+=("$pgid"); PORTS+=("$port")
+      CMDS+=("$(ps -o cmd= -p "$(group_pids "$pgid")" 2>/dev/null | tr '\n' ' ' || true)")
+    done
+    while read -r port pid; do
+      [[ "${pid:-}" =~ ^[0-9]+$ ]] || continue
+      if [[ " $seen_pids " == *" $pid "* ]]; then continue; fi   # one entry per pid
+      cmd="$(ps -o cmd= -p "$pid" 2>/dev/null || true)"
+      case "$cmd" in
+        *llama-server*|*maya.py*|*basalt*) ;;
+        *) continue ;;
+      esac
+      pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ -n "$pgid" && " $group_pgids " == *" $pgid "* ]]; then continue; fi
+      seen_pids="$seen_pids $pid"
+      [[ -z "$port_filter" || "$port" == "$port_filter" ]] || continue
+      TARGETS+=("$pid"); PORTS+=("$port")
+      CMDS+=("$(ps -o cmd= -p "$(group_pids "$pid")" 2>/dev/null | tr '\n' ' ' || true)")
+    done < <(ss -ltnpH 2>/dev/null | awk '$1 == "LISTEN" && match($0, /pid=[0-9]+/) {
+                port = $4; sub(/.*:/, "", port); print port + 0, substr($0, RSTART + 4, RLENGTH - 4)
+              }' | sort -n || true)
+
+    if [[ ${#TARGETS[@]} -eq 0 ]]; then
+      echo "No server running."
       if command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu \
-          --format=csv,noheader | awk -F', ' '{printf "GPU: %s | Util: %s | VRAM: %s / %s | Power: %s | Temp: %s C\n", $1, $2, $3, $4, $5, $6}'
+          --format=csv,noheader | awk -F', ' '{printf "GPU: %s | Util: %s | VRAM: %s / %s | Power: %s | Temp: %s C\n", $1, $2, $3, $4, $5, $6}' || true
       fi
       return 0
     fi
-    ps -p $pids -o pid,etime,%cpu,%mem,rss,cmd
-    echo
-    "$ENGINES/bin/llm-stats" --port "$PORT" --once "$@"
+
+    local i engine elabel profile model alias
+    for i in "${!TARGETS[@]}"; do
+      cmd="${CMDS[$i]}"
+      engine="auto"; elabel="unknown"; profile="-"
+      case "$cmd" in
+        *llama-server*) engine="llamacpp"; elabel="llama.cpp" ;;
+        *maya.py*) engine="maya"; elabel="Maya"; profile="deepseek" ;;
+        *basalt*) engine="basalt"; elabel="Basalt"; profile="qwen" ;;
+      esac
+      model=""
+      if command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        model="$(curl -s -m 2 "http://127.0.0.1:${PORTS[$i]}/v1/models" | jq -r '.data[0].id // empty' 2>/dev/null || true)"
+      fi
+      alias="$(printf '%s' "$cmd" | grep -oE -- '--alias [^ ]+' | head -n1 | cut -d' ' -f2 || true)"
+      [[ -n "$model" ]] || model="$alias"
+      if [[ "$engine" == "llamacpp" ]]; then
+        case "$model" in
+          qwen3.8-flash-next) profile="qwen-llama" ;;
+          deepseek-v4.1-flash) profile="deepseek-llama" ;;
+        esac
+      fi
+      [[ -n "$model" ]] || model="-"
+      echo "== port ${PORTS[$i]} | engine $elabel | profile $profile | model $model"
+      ps -o pid,etime,%cpu,%mem,rss,cmd -p "$(group_pids "${TARGETS[$i]}")" 2>/dev/null | cut -c1-150 || true
+      "$ENGINES/bin/llm-stats" --port "${PORTS[$i]}" --host 127.0.0.1 --engine "$engine" --once "${REST[@]}" || true
+      echo
+    done
   }
 
   if [[ "${1:-}" == "-d" ]]; then
@@ -98,8 +324,11 @@ EOF
       ;;
     --list|list)
       echo "Profiles:"
-      echo "  qwen      Qwen3.8-Flash-Next UD-Q4_K_XL + MTP Q8_0, 256k native ctx (default)"
-      echo "  deepseek  DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL + DSpark Q8_0, 512k ctx"
+      echo "  qwen      Qwen UD-Q4_K_XL on Basalt: faster, closer to BF16 (default)"
+      echo "  deepseek  DeepSeek UD-Q2_K_XL on Project Maya: faithful to DeepSeek's reference, ~20x faster long prompts"
+      echo "  qwen-llama      Qwen UD-Q4_K_XL + MTP Q8_0, 256k ctx, f16 KV, -fitt (llama.cpp fallback)"
+      echo "  deepseek-llama  DeepSeek UD-Q2_K_XL + DSpark Q8_0, 512k ctx, GPU expert cache + CPU share (llama.cpp fallback)"
+      echo "  qwen-basalt / deepseek-maya  aliases of qwen / deepseek"
       return 0
       ;;
     --stop|stop)
@@ -120,16 +349,26 @@ EOF
 
   local PROFILE="${1:-qwen}"
   [[ $# -gt 0 ]] && shift
-
-  local -a ARGS=()
   case "$PROFILE" in
-    qwen)
+    qwen-basalt) PROFILE="qwen" ;;
+    deepseek-maya) PROFILE="deepseek" ;;
+  esac
+
+  # DRY_RUN must leave LOG_DIR untouched; engine configs are generated into a
+  # temp file and only written to $CONFIG after the port check below passes.
+  [[ "${DRY_RUN:-0}" == 1 ]] || mkdir -p "$LOG_DIR"
+  local -a ARGS=() CMD=()
+  RUN_CWD="" CONFIG="" CONFIG_TMP="" SYNC_ALIAS="" SYNC_CTX=""
+  case "$PROFILE" in
+    qwen-llama)
       # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP Q8_0 draft head, 256k native ctx (set CTX=524288 for YaRN 2x)
       local ctx="${CTX:-262144}"
       ARGS=(
         -m  "$MODELS/qwen3.8-unsloth-v3.1/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
         -c "$ctx" -np 1
-        -ctk q8_0 -ctv q8_0 -fa on
+        -ctk f16 -ctv f16 -fa on
+        -ub 1024 -b 2048
+        -fitt "$VRAM_RESERVE_MIB"
         --load-mode none
         --alias qwen3.8-flash-next
       )
@@ -139,23 +378,102 @@ EOF
       if (( ctx > 262144 )); then
         ARGS+=(--rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144)
       fi
+      SYNC_ALIAS="qwen3.8-flash-next"
+      SYNC_CTX="$ctx"
       ;;
-    deepseek)
+    deepseek-llama)
       # DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL (~312 GiB) + DSpark Q8_0 drafter.
       # NOTE: larger than VRAM+RAM, so part of it is paged from disk via mmap.
-      # Benchmark (v1.0.0) showed -fit on outperforms -cmoe when mmap'd > RAM.
+      # Benchmark: -cmoe with a VRAM-sized MoE cache beats -fit on here.
       local ctx="${CTX:-524288}"
+      local cache="${MOE_CACHE_MIB:-}"
+      if [[ -z "$cache" ]]; then
+        local free
+        if free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d '[:space:]')" && [[ "$free" =~ ^[0-9]+$ ]]; then
+          cache=$(( free - VRAM_RESERVE_MIB - DS_NONCACHE_MIB ))
+          if (( cache < 8000 )); then
+            echo "deepseek-llama: warning: only $free MiB VRAM free; is another model still loaded? (llm-serve --status)" >&2
+            cache=8000
+          fi
+          echo "deepseek-llama: MoE cache $cache MiB (free $free - reserve $VRAM_RESERVE_MIB - other $DS_NONCACHE_MIB)"
+        else
+          cache=60000
+          echo "deepseek-llama: nvidia-smi failed; falling back to MoE cache $cache MiB" >&2
+        fi
+      fi
       ARGS=(
         -m  "$MODELS/deepseek-v41-1017/UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf"
         -c "$ctx" -np 1
         -ctk q8_0 -ctv q8_0 -fa on
+        -ngl 99 -cmoe --moe-cache-mib "$cache" --moe-cache-cpu-share "$MOE_CPU_SHARE"
         --alias deepseek-v4.1-flash
       )
       if (( SPEC )); then
-        ARGS+=(-md "$MODELS/deepseek-v41-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf" --spec-type draft-dspark --spec-draft-n-max 3 -fitt 12288)
-      else
-        ARGS+=(-fitt 4096)
+        ARGS+=(-md "$MODELS/deepseek-v41-1017/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf" --spec-type draft-dspark --spec-draft-n-max 3)
       fi
+      SYNC_ALIAS="deepseek-v4.1-flash"
+      SYNC_CTX="$ctx"
+      ;;
+    deepseek)
+      # DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL on the Project Maya engine.
+      # Config = the maya template minus the refusal-direction ablation args and
+      # the ablate keys (this profile must never load the refusal-direction
+      # file), with ctx and VRAM reserve taken from the environment.
+      local ctx="${CTX:-524288}"
+      [[ -n "$HOST_SET" ]] || HOST="127.0.0.1"
+      CONFIG="$LOG_DIR/maya-ds4.json"
+      local tpl="$MAYA_DIR/maya-ds4.json"
+      if [[ ! -f "$tpl" ]]; then
+        echo "deepseek: template not found: $tpl (set MAYA_DIR)" >&2
+        return 1
+      fi
+      CONFIG_TMP="$(mktemp)"
+      jq --arg ctx "$ctx" --arg rsv "$VRAM_RESERVE_MIB" '
+        .args as $a
+        | .args = [ range($a | length) as $i | $a[$i]
+            | select(. != "--ablate" and . != "--ablate-default"
+                     and ($i == 0 or ($a[$i-1] != "--ablate" and $a[$i-1] != "--ablate-default"))) ]
+        | .args as $b
+        | .args = [ range($b | length) as $i
+            | if $i > 0 and $b[$i-1] == "--max-context" then $ctx
+              elif $i > 0 and $b[$i-1] == "--reserve-mib" then $rsv
+              else $b[$i] end ]
+        | del(.ablate)
+        | if .sampling then .sampling |= del(.ablate) else . end
+      ' "$tpl" > "$CONFIG_TMP"
+      RUN_CWD="$MAYA_DIR"
+      CMD=(
+        "$MAYA_DIR/.venv/bin/python" "$MAYA_DIR/maya.py"
+        --config "$CONFIG" --host "$HOST" --port "$PORT" "$@"
+      )
+      SYNC_ALIAS="deepseek-v4.1-flash"
+      SYNC_CTX="$ctx"
+      ;;
+    qwen)
+      # Qwen3.8-Flash-Next UD-Q4_K_XL on the Basalt engine.
+      # answer-room 0: Basalt's default caps thinking at half of max_tokens.
+      # +700 on the reserve: vram-reserve-mib doubles as Basalt's own scratch reserve.
+      local ctx="${CTX:-262144}"
+      [[ -n "$HOST_SET" ]] || HOST="127.0.0.1"
+      CONFIG="$LOG_DIR/basalt-qwen.json"
+      CONFIG_TMP="$(mktemp)"
+      jq -n \
+        --arg model "$MODELS/qwen3.8-unsloth-v3.1/basalt/Qwen3.8-FN-UD-Q4_K_XL.basalt" \
+        --arg host "$HOST" \
+        --argjson ctx "$ctx" \
+        --argjson port "$PORT" \
+        --argjson rsv "$(( VRAM_RESERVE_MIB + 700 ))" \
+        --argjson spec "$SPEC" \
+        '{version: 2,
+          models: [{alias: "qwen3.8-flash-next", model: $model, gpu: "0", kv: "fp16"}],
+          engine: ({"max-context": $ctx, "vram-reserve-mib": $rsv,
+                    "resident-experts": true, "answer-room": 0}
+                   + (if $spec == 0 then {spec: 0} else {} end)),
+          server: {host: $host, port: $port}}' > "$CONFIG_TMP"
+      RUN_CWD="$BASALT_DIR"
+      CMD=("$BASALT_DIR/bin/basalt" serve --config "$CONFIG" "$@")
+      SYNC_ALIAS="qwen3.8-flash-next"
+      SYNC_CTX="$ctx"
       ;;
     *)
       echo "Unknown profile or flag: $PROFILE (try: llm-serve --help)" >&2
@@ -172,13 +490,7 @@ EOF
     [[ "${OPENCODE_SYNC:-1}" == 1 && -f "$cfg" ]] || return 0
     command -v jq >/dev/null 2>&1 || { echo "opencode: jq not found; default model not updated." >&2; return 0; }
 
-    local alias="" ctx="" i
-    for (( i = 0; i < ${#ARGS[@]} - 1; i++ )); do
-      case "${ARGS[i]}" in
-        --alias) alias="${ARGS[i+1]%%,*}" ;;
-        -c)      ctx="${ARGS[i+1]}" ;;
-      esac
-    done
+    local alias="$SYNC_ALIAS" ctx="$SYNC_CTX"
     [[ -n "$alias" ]] || return 0
 
     local base
@@ -206,26 +518,67 @@ EOF
     fi
   }
 
-  if pgrep -a -x llama-server | grep -q -- "--port $PORT"; then
-    echo "A llama-server is already running on port $PORT. Stop it with: llm-serve --stop" >&2
+  if (( ${#CMD[@]} == 0 )); then
+    CMD=("$LLAMA_BIN" "${ARGS[@]}" --metrics --log-timestamps --host "$HOST" --port "$PORT" "$@")
+  fi
+
+  if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    local line
+    line="$(printf '%q ' "${CMD[@]}")"
+    echo "${line% }"
+    if [[ -n "$CONFIG_TMP" ]]; then
+      echo "# $CONFIG"
+      cat "$CONFIG_TMP"
+      rm -f "$CONFIG_TMP"
+    fi
+    return 0
+  fi
+
+  if ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
+    [[ -z "$CONFIG_TMP" ]] || rm -f "$CONFIG_TMP"
+    echo "Something is already listening on port $PORT. Stop it with: llm-serve --stop $PORT" >&2
     return 1
+  fi
+
+  # the port is free: now, and not before, the live config goes into $LOG_DIR
+  if [[ -n "$CONFIG_TMP" ]]; then
+    cat "$CONFIG_TMP" > "$CONFIG"
+    rm -f "$CONFIG_TMP"
   fi
 
   sync_opencode
 
-  mkdir -p "$LOG_DIR"
   local LOG="$LOG_DIR/llama-$PROFILE.log"
-  local -a CMD=("$LLAMA_BIN" "${ARGS[@]}" --metrics --log-timestamps --host "$HOST" --port "$PORT" "$@")
 
   echo "Profile: $PROFILE   Endpoint: http://$HOST:$PORT/v1   Log: $LOG"
   echo "Status:  llm-serve --status   Live stats: llm-serve --stats   Stop: llm-serve --stop"
 
   if (( DAEMON )); then
-    setsid nohup "${CMD[@]}" >"$LOG" 2>&1 < /dev/null &
+    local pid pgid starttime _i
+    if [[ -n "$RUN_CWD" ]]; then
+      ( cd "$RUN_CWD" && exec setsid nohup "${CMD[@]}" ) >"$LOG" 2>&1 < /dev/null &
+    else
+      setsid nohup "${CMD[@]}" >"$LOG" 2>&1 < /dev/null &
+    fi
+    pid=$!
     disown
-    echo "Started in background (PID $!). Follow the log: tail -f $LOG"
+    # A background job of this non-interactive script is not a group leader, so
+    # setsid execs in place: the new session id (= group id) is the job's pid.
+    pgid="$pid"
+    starttime=""
+    for _i in {1..20}; do
+      starttime="$(starttime_of "$pid" || true)"
+      [[ -n "$starttime" ]] && break
+      sleep 0.1
+    done
+    echo "$pgid${starttime:+ $starttime}" > "$LOG_DIR/serve-$PORT.pid"
+    echo "Started in background (PGID $pgid). Follow the log: tail -f $LOG"
   else
-    "${CMD[@]}" 2>&1 | tee "$LOG"
+    if [[ -n "$RUN_CWD" ]]; then
+      ( cd "$RUN_CWD" && exec "${CMD[@]}" ) 2>&1 | tee "$LOG"
+    else
+      "${CMD[@]}" 2>&1 | tee "$LOG"
+    fi
   fi
 }
 

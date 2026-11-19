@@ -45,15 +45,45 @@ ln -s "$PWD"/bin/llm-* ~/.local/bin/
 ## Serving
 
 ```bash
-llm-serve qwen              # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP draft, 256k ctx
-llm-serve -d deepseek       # DeepSeek-V4.1-Flash UD-Q2_K_XL + DSpark draft, 512k ctx, background
+llm-serve qwen              # Qwen UD-Q4_K_XL on Basalt: faster, closer to BF16 (default)
+llm-serve -d deepseek       # DeepSeek UD-Q2_K_XL on Project Maya: faithful to DeepSeek's reference, ~20x faster long prompts, background
+llm-serve qwen-llama        # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP draft, 256k ctx (llama.cpp fallback)
+llm-serve deepseek-llama    # DeepSeek-V4.1-Flash UD-Q2_K_XL + DSpark draft, 512k ctx (llama.cpp fallback)
 llm-serve --status
 llm-serve --stop
+DRY_RUN=1 llm-serve qwen    # print the full launch command, start nothing
 ```
 
-Both profiles serve on port 8000, one at a time. Environment overrides: `PORT`,
-`HOST`, `CTX`, `SPEC=0` (no speculative decoding), `MODELS`, `LLAMA_BIN`, `LOG_DIR`.
-Extra arguments after the profile go straight to `llama-server`.
+All profiles serve on port 8000, one at a time. `qwen` and `deepseek` run the
+models on their own engines (Basalt, Project Maya) instead of llama.cpp
+(`qwen-basalt` and `deepseek-maya` are kept as aliases of them); `llm-serve`
+generates their config into `$LOG_DIR` (from
+`$MAYA_DIR/maya-ds4.json`, minus the refusal-direction ablation args and the
+`ablate` keys, for Maya) and `--status` / `--stop` cover them too: `--stop`
+verifies each pid file still belongs to one of our servers (recorded start time
++ cmdline) before signalling anything, and stops servers by session, so engine
+children go with them. Environment overrides: `PORT`, `HOST`,
+`CTX`, `SPEC=0` (no speculative decoding), `MODELS`, `LLAMA_BIN`, `LOG_DIR`,
+`MAYA_DIR` (default `~/dev/maya-src`), `BASALT_DIR` (default `~/dev/basalt-src`),
+`DRY_RUN=1` (print the command — plus the generated config for the two engine
+profiles — and exit; no server, no opencode sync, nothing written to `$LOG_DIR`). Extra arguments after the
+profile go to `llama-server` (or to `maya.py` / `basalt serve`).
+`HOST` defaults to `0.0.0.0`, except `qwen` and `deepseek` (Basalt and Maya),
+which bind to `127.0.0.1` unless `HOST` is set explicitly.
+
+The GPU also drives the desktop, so both profiles leave VRAM headroom:
+
+| Env | Default | Effect |
+|---|---|---|
+| `VRAM_RESERVE_MIB` | 3072 | VRAM kept free for the desktop; qwen-llama passes it to `-fitt` |
+| `MOE_CACHE_MIB` | computed | deepseek-llama MoE cache size; default = free VRAM (GPU 0) − `VRAM_RESERVE_MIB` − `DS_NONCACHE_MIB`, min 8000 (60000 if `nvidia-smi` fails) |
+| `DS_NONCACHE_MIB` | 23000 | deepseek-llama's measured non-cache VRAM at 512k ctx with DSpark |
+| `MOE_CPU_SHARE` | 0.85 | share of MoE cache misses computed on CPU from RAM experts instead of uploaded to GPU |
+
+qwen-llama runs with f16 KV cache, `-ub 1024 -b 2048` and `-fitt $VRAM_RESERVE_MIB`;
+deepseek-llama runs `-ngl 99 -cmoe`: the experts stay in RAM and a GPU cache holds the
+most-used ones (`--moe-cache-mib`, sized from the free VRAM at startup); the CPU
+computes most cache misses (`MOE_CPU_SHARE`).
 
 ### opencode
 
