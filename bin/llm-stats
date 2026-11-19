@@ -149,10 +149,14 @@ def rate(m, tok_key, sec_key):
     return PREV.get(tok_key + "_last"), avg
 
 
-def fmt_rate(live, avg):
+def fmt_rate(live, avg, now=None):
+    """(last, average) tok/s. now = Maya's live in-flight rate: shown as "now" instead of "last"."""
+    lab = "last"
+    if is_num(now):
+        live, lab = now, "now "   # "now " pads to 4 chars: "last" columns stay aligned
     l = f"{live:8.1f}" if live is not None else "       -"
     v = f"{avg:8.1f}" if avg is not None else "       -"
-    return f"last {l} tok/s   avg {v} tok/s"
+    return f"{lab} {l} tok/s   avg {v} tok/s"
 
 
 def num(v):
@@ -230,11 +234,23 @@ def render():
                 parts.append(f"elapsed {lv['elapsed_s']:.1f} s")
             if parts:
                 lines.append("Live       " + "  ".join(parts))
-    lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"))
+    pnow = gnow = None   # Maya live rate overrides: shown instead of "last" while a request runs
+    psuf = gsuf = ""     # "in flight" suffixes, only ever set together with their override
+    if ENGINE == "maya":   # Maya's counters only move when a request ends: lv is set above
+        st = lv.get("state")
+        if st == "reading" and is_num(lv.get("prefill_tok_s_mean")):
+            pnow = lv["prefill_tok_s_mean"]
+            if is_num(lv.get("prompt_read")) and is_num(lv.get("prompt_total")):
+                psuf = f", +{num(lv['prompt_read'])}/{num(lv['prompt_total'])} in flight"
+        elif st == "generating" and is_num(lv.get("tok_s")):
+            gnow = lv["tok_s"]
+            if is_num(lv.get("generated")):
+                gsuf = f", +{num(lv['generated'])} in flight"
+    lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"), now=pnow)
                  + f"   ({num(m.get('prompt_tokens_total'))} tok, "
-                 f"{num(m.get('prompt_tokens_cached_total'))} cached)")
-    lines.append("Generate   " + fmt_rate(*rate(m, "tokens_predicted_total", "tokens_predicted_seconds_total"))
-                 + f"   ({num(m.get('tokens_predicted_total'))} tok)")
+                 f"{num(m.get('prompt_tokens_cached_total'))} cached{psuf})")
+    lines.append("Generate   " + fmt_rate(*rate(m, "tokens_predicted_total", "tokens_predicted_seconds_total"), now=gnow)
+                 + f"   ({num(m.get('tokens_predicted_total'))} tok{gsuf})")
     if ENGINE == "basalt":
         off = sum(s["drafts_offered"] for s in slots if s.get("drafts_offered") is not None)
         acc = sum(s["drafts_accepted"] for s in slots if s.get("drafts_accepted") is not None)
