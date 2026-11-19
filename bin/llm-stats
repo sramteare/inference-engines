@@ -236,16 +236,24 @@ def render():
                 lines.append("Live       " + "  ".join(parts))
     pnow = gnow = None   # Maya live rate overrides: shown instead of "last" while a request runs
     psuf = gsuf = ""     # "in flight" suffixes, only ever set together with their override
-    if ENGINE == "maya":   # Maya's counters only move when a request ends: lv is set above
-        st = lv.get("state")
-        if st == "reading" and is_num(lv.get("prefill_tok_s_mean")):
-            pnow = lv["prefill_tok_s_mean"]
-            if is_num(lv.get("prompt_read")) and is_num(lv.get("prompt_total")):
-                psuf = f", +{num(lv['prompt_read'])}/{num(lv['prompt_total'])} in flight"
-        elif st == "generating" and is_num(lv.get("tok_s")):
-            gnow = lv["tok_s"]
-            if is_num(lv.get("generated")):
-                gsuf = f", +{num(lv['generated'])} in flight"
+    if ENGINE == "maya":   # Maya's counters only move when a request ends: lv and state are set above
+        ptk = lv.get("prompt_tokens")   # the current request's prompt length, set the moment it starts
+        if state == "reading" and is_num(ptk) and lv.get("prompt_total") == ptk:
+            # just after a request starts, live still holds the previous request's reading values
+            if is_num(lv.get("prefill_tok_s_mean")):
+                pnow = lv["prefill_tok_s_mean"]
+                pr, pt, ru = lv.get("prompt_read"), ptk, lv.get("prompt_reused")
+                if is_num(pr):
+                    if is_num(ru):   # prompt_read includes the cached prefix: count only fresh tokens
+                        pr, pt = max(pr - ru, 0), max(pt - ru, 0)
+                    psuf = f", +{num(pr)}/{num(pt)} in flight"
+        elif state == "generating":
+            if is_num(lv.get("prefill_tok_s_mean")) and lv["prefill_tok_s_mean"] > 0:
+                pnow = lv["prefill_tok_s_mean"]   # stays set for the whole request: this request's prefill
+            if is_num(lv.get("tok_s")):
+                gnow = lv["tok_s"]
+                if is_num(lv.get("generated")):
+                    gsuf = f", +{num(lv['generated'])} in flight"
     lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"), now=pnow)
                  + f"   ({num(m.get('prompt_tokens_total'))} tok, "
                  f"{num(m.get('prompt_tokens_cached_total'))} cached{psuf})")
