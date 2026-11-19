@@ -153,10 +153,10 @@ def fmt_rate(live, avg, now=None):
     """(last, average) tok/s. now = Maya's live in-flight rate: shown as "now" instead of "last"."""
     lab = "last"
     if is_num(now):
-        live, lab = now, "now "   # "now " pads to 4 chars: "last" columns stay aligned
+        live, lab = now, "now"
     l = f"{live:8.1f}" if live is not None else "       -"
     v = f"{avg:8.1f}" if avg is not None else "       -"
-    return f"{lab} {l} tok/s   avg {v} tok/s"
+    return f"{lab:<4} {l} tok/s   avg {v} tok/s"
 
 
 def num(v):
@@ -238,21 +238,32 @@ def render():
     psuf = gsuf = ""     # "in flight" suffixes, only ever set together with their override
     if ENGINE == "maya":   # Maya's counters only move when a request ends: lv and state are set above
         ptk = lv.get("prompt_tokens")   # the current request's prompt length, set the moment it starts
-        if state == "reading" and is_num(ptk) and lv.get("prompt_total") == ptk:
-            # just after a request starts, live still holds the previous request's reading values
-            if is_num(lv.get("prefill_tok_s_mean")):
-                pnow = lv["prefill_tok_s_mean"]
-                pr, pt, ru = lv.get("prompt_read"), ptk, lv.get("prompt_reused")
-                if is_num(pr):
-                    if is_num(ru):   # prompt_read includes the cached prefix: count only fresh tokens
-                        pr, pt = max(pr - ru, 0), max(pt - ru, 0)
-                    psuf = f", +{num(pr)}/{num(pt)} in flight"
+        # A request is identified across frames by its start time: elapsed_s is time since it started.
+        start = time.time() - lv["elapsed_s"] if is_num(lv.get("elapsed_s")) else None
+        pm = PREV.get("maya_prefill")   # (start, rate): first positive prefill rate of a request
+        pv = lv.get("prefill_tok_s_mean")
+        # just after a request starts, live still holds the previous request's reading values: they
+        # always end with prompt_read == prompt_total, so require a still-growing read
+        reading = (is_num(ptk) and lv.get("prompt_total") == ptk
+                   and is_num(lv.get("prompt_total")) and is_num(lv.get("prompt_read"))
+                   and lv["prompt_read"] < lv["prompt_total"])
+        if start is not None and is_num(pv) and pv > 0 and ((state == "reading" and reading) or state == "generating"):
+            if not (pm and abs(start - pm[0]) < 2):   # a new request replaces the memo
+                pm = PREV["maya_prefill"] = (start, pv)
+        if state == "reading" and reading and is_num(pv) and pv > 0:
+            pnow = pv
+            pr, pt, ru = lv.get("prompt_read"), ptk, lv.get("prompt_reused")
+            if is_num(pr) and pr >= 0:
+                if is_num(ru) and ru > 0:   # prompt_read includes the cached prefix: count only fresh tokens
+                    pr, pt = max(pr - ru, 0), max(pt - ru, 0)
+                psuf = f", +{num(pr)}/{num(pt)} in flight"
         elif state == "generating":
-            if is_num(lv.get("prefill_tok_s_mean")) and lv["prefill_tok_s_mean"] > 0:
-                pnow = lv["prefill_tok_s_mean"]   # stays set for the whole request: this request's prefill
-            if is_num(lv.get("tok_s")):
-                gnow = lv["tok_s"]
-                if is_num(lv.get("generated")):
+            if start is not None and pm and abs(start - pm[0]) < 2:
+                pnow = pm[1]   # first prefill rate of this request, not a later noisy re-read
+            ts = lv.get("tok_s")
+            if is_num(ts) and ts >= 0:
+                gnow = ts
+                if is_num(lv.get("generated")) and lv["generated"] >= 0:
                     gsuf = f", +{num(lv['generated'])} in flight"
     lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"), now=pnow)
                  + f"   ({num(m.get('prompt_tokens_total'))} tok, "
