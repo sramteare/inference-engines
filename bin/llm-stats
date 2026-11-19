@@ -5,7 +5,7 @@ Usage: llm-stats [--port 8000] [--host localhost] [--interval 1] [--once] [--eng
 --engine auto (default) detects the engine from /health and /v1/status, and re-detects if the server goes away or changes.
 Requires llama-server started with --metrics (llm-serve does this).
 """
-import argparse, json, re, subprocess, sys, time, urllib.request
+import argparse, json, math, re, subprocess, sys, time, urllib.request
 
 p = argparse.ArgumentParser()
 p.add_argument("--host", default="localhost")
@@ -21,8 +21,8 @@ AUTO = a.engine == "auto"      # only auto mode may re-detect the engine after s
 LAST_DETECT = 0.0              # monotonic time of the last detect() in auto mode
 
 
-def get(path, as_json=True):
-    with urllib.request.urlopen(BASE + path, timeout=2) as r:
+def get(path, as_json=True, timeout=2):
+    with urllib.request.urlopen(BASE + path, timeout=timeout) as r:
         body = r.read().decode()
     return json.loads(body) if as_json else body
 
@@ -82,7 +82,17 @@ def metrics():
     if ENGINE == "basalt":
         return basalt_metrics()
     if ENGINE == "maya":
-        return prom_metrics("/metrics/prometheus"), None   # Maya's Prometheus text
+        try:
+            eng = get("/metrics", timeout=1)   # Maya's JSON /metrics: live + engine blocks (once per frame)
+        except Exception:
+            eng = None              # tolerate absence: no live line / header extras
+        if isinstance(eng, dict):   # tolerate a malformed body: keep only dict blocks
+            e, l = eng.get("engine"), eng.get("live")
+            eng = {"engine": e if isinstance(e, dict) else {},
+                   "live": l if isinstance(l, dict) else {}}
+        else:
+            eng = None
+        return prom_metrics("/metrics/prometheus"), eng    # counters come from the Prometheus text
     return prom_metrics("/metrics"), None
 
 
@@ -149,6 +159,12 @@ def num(v):
     return f"{int(v)}" if v is not None else "-"
 
 
+def is_num(v):
+    # finite int/float only: no bool, NaN or Infinity (JSON 1e309) reaching num() or ":.1f";
+    # abs(v) < 1e18 first so isfinite never sees a huge int (OverflowError on a 400-digit JSON number)
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 1e18 and math.isfinite(v)
+
+
 def render():
     global ENGINE, LAST_DETECT
     if AUTO and ENGINE is None:
@@ -183,10 +199,37 @@ def render():
         extra = ", ".join(x for x in [f"basalt {e['version']}" if e.get("version") else "",
                                       e.get("quant") or "", f"kv {e['kv']}" if e.get("kv") else ""] if x)
         head += f"   {extra}" if extra else ""
+    elif ENGINE == "maya":
+        e = (eng or {}).get("engine") or {}
+        extra = ", ".join(x for x in [str(e.get("model_label") or ""), str(e.get("version") or ""),
+                                      f"kv {e['kv']}" if e.get("kv") else ""] if x)
+        head += f"   {extra}" if extra else ""
     lines.append(head)
     lines.append("-" * 72)
     lines.append(f"Load       processing: {num(m.get('requests_processing'))}   "
                  f"queued: {num(m.get('requests_deferred'))}")
+    if ENGINE == "maya":
+        lv = (eng or {}).get("live") or {}
+        state = lv.get("state")
+        if isinstance(state, str) and state and state != "idle":   # live progress while generating; "" = no request
+            parts = [lv["phase"]] if isinstance(lv.get("phase"), str) and lv["phase"] else []
+            pr, pt = lv.get("prompt_read"), lv.get("prompt_total")
+            if state == "reading" and is_num(pr) and is_num(pt):
+                parts.append(f"prompt {num(pr)}/{num(pt)} tok")   # Maya sets these only while reading
+            elif is_num(lv.get("generated")):
+                g = f"generated {num(lv['generated'])}"
+                if is_num(lv.get("max_tokens")) and lv["max_tokens"] > 0:   # 0/-1 = rest of the context
+                    g += f"/{num(lv['max_tokens'])}"
+                parts.append(g + " tok")
+            if is_num(lv.get("tok_s")):
+                r = f"{lv['tok_s']:.1f} tok/s now"
+                if is_num(lv.get("tok_s_mean")):
+                    r += f" (mean {lv['tok_s_mean']:.1f})"
+                parts.append(r)
+            if is_num(lv.get("elapsed_s")):
+                parts.append(f"elapsed {lv['elapsed_s']:.1f} s")
+            if parts:
+                lines.append("Live       " + "  ".join(parts))
     lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"))
                  + f"   ({num(m.get('prompt_tokens_total'))} tok, "
                  f"{num(m.get('prompt_tokens_cached_total'))} cached)")
