@@ -21,8 +21,8 @@ AUTO = a.engine == "auto"      # only auto mode may re-detect the engine after s
 LAST_DETECT = 0.0              # monotonic time of the last detect() in auto mode
 
 
-def get(path, as_json=True):
-    with urllib.request.urlopen(BASE + path, timeout=2) as r:
+def get(path, as_json=True, timeout=2):
+    with urllib.request.urlopen(BASE + path, timeout=timeout) as r:
         body = r.read().decode()
     return json.loads(body) if as_json else body
 
@@ -83,9 +83,15 @@ def metrics():
         return basalt_metrics()
     if ENGINE == "maya":
         try:
-            eng = get("/metrics")   # Maya's JSON /metrics: live + engine blocks (once per frame)
+            eng = get("/metrics", timeout=1)   # Maya's JSON /metrics: live + engine blocks (once per frame)
         except Exception:
             eng = None              # tolerate absence: no live line / header extras
+        if isinstance(eng, dict):   # tolerate a malformed body: keep only dict blocks
+            e, l = eng.get("engine"), eng.get("live")
+            eng = {"engine": e if isinstance(e, dict) else {},
+                   "live": l if isinstance(l, dict) else {}}
+        else:
+            eng = None
         return prom_metrics("/metrics/prometheus"), eng    # counters come from the Prometheus text
     return prom_metrics("/metrics"), None
 
@@ -153,6 +159,10 @@ def num(v):
     return f"{int(v)}" if v is not None else "-"
 
 
+def is_num(v):
+    return isinstance(v, (int, float))   # guard a malformed /metrics against ":.1f"
+
+
 def render():
     global ENGINE, LAST_DETECT
     if AUTO and ENGINE is None:
@@ -189,7 +199,7 @@ def render():
         head += f"   {extra}" if extra else ""
     elif ENGINE == "maya":
         e = (eng or {}).get("engine") or {}
-        extra = ", ".join(x for x in [e.get("model_label") or "", e.get("version") or "",
+        extra = ", ".join(x for x in [str(e.get("model_label") or ""), str(e.get("version") or ""),
                                       f"kv {e['kv']}" if e.get("kv") else ""] if x)
         head += f"   {extra}" if extra else ""
     lines.append(head)
@@ -199,21 +209,21 @@ def render():
     if ENGINE == "maya":
         lv = (eng or {}).get("live") or {}
         if lv.get("state") and lv["state"] != "idle":   # live progress while generating
-            parts = [lv["phase"]] if lv.get("phase") else []
+            parts = [str(lv["phase"])] if lv.get("phase") else []
             pr, pt = lv.get("prompt_read"), lv.get("prompt_total")
-            if pr is not None and pt is not None:
-                parts.append(f"prompt {num(pr)}/{num(pt)} tok")
-            elif lv.get("generated") is not None:
+            if lv.get("state") == "reading" and is_num(pr) and is_num(pt):
+                parts.append(f"prompt {num(pr)}/{num(pt)} tok")   # Maya sets these only while reading
+            elif is_num(lv.get("generated")):
                 g = f"generated {num(lv['generated'])}"
-                if lv.get("max_tokens") is not None:
+                if is_num(lv.get("max_tokens")) and lv["max_tokens"] > 0:   # 0/-1 = rest of the context
                     g += f"/{num(lv['max_tokens'])}"
                 parts.append(g + " tok")
-            if lv.get("tok_s") is not None:
+            if is_num(lv.get("tok_s")):
                 r = f"{lv['tok_s']:.1f} tok/s now"
-                if lv.get("tok_s_mean") is not None:
+                if is_num(lv.get("tok_s_mean")):
                     r += f" (mean {lv['tok_s_mean']:.1f})"
                 parts.append(r)
-            if lv.get("elapsed_s") is not None:
+            if is_num(lv.get("elapsed_s")):
                 parts.append(f"elapsed {lv['elapsed_s']:.1f} s")
             if parts:
                 lines.append("Live       " + "  ".join(parts))
