@@ -27,6 +27,14 @@ def live_line(stdout):
     return lines[0]
 
 
+def rate_line(stdout, prefix):
+    """The single dashboard line that starts with the given prefix ("Prefill"/"Generate")."""
+    lines = [ln for ln in stdout.splitlines() if ln.startswith(prefix)]
+    if len(lines) != 1:
+        raise AssertionError(f"expected exactly one {prefix} line in:\n{stdout}")
+    return lines[0]
+
+
 class StubHandler(BaseHTTPRequestHandler):
     def respond(self, routes):
         bad = self.path not in routes
@@ -209,6 +217,50 @@ class LlmStatsMayaTest(unittest.TestCase):
         gen = [ln for ln in out.stdout.splitlines() if ln.startswith("Generate")]
         self.assertEqual(len(gen), 1, out.stdout)
         self.assertIn("42 tok", gen[0])
+
+    def test_reading_prefill_shows_now_rate_and_in_flight(self):
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 12000, "prompt_total": 40000}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIn("now ", pre)
+        self.assertIn("1234.5", pre)
+        self.assertIn("+12000/40000 in flight", pre)
+        gen = rate_line(out.stdout, "Generate")
+        self.assertTrue(gen.startswith("Generate   last "), gen)   # first column stays "last"
+        self.assertNotIn("now", gen)
+
+    def test_generating_generate_shows_now_rate_and_in_flight(self):
+        live = {"state": "generating", "tok_s": 31.2, "generated": 412}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        gen = rate_line(out.stdout, "Generate")
+        self.assertIn("now ", gen)
+        self.assertIn("31.2", gen)
+        self.assertIn("+412 in flight", gen)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertTrue(pre.startswith("Prefill    last "), pre)
+        self.assertNotIn("in flight", pre)
+
+    def test_idle_prefill_generate_use_last(self):
+        out = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for prefix in ("Prefill", "Generate"):
+            line = rate_line(out.stdout, prefix)
+            self.assertNotIn("now", line)
+            self.assertNotIn("in flight", line)
+
+    def test_generating_bad_tok_s_falls_back_to_idle_generate_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Generate")
+        for ts in [None, "fast", True]:
+            out = run_stats(self.serve(live={"state": "generating", "tok_s": ts, "generated": 412}))
+            self.assertEqual(out.returncode, 0, f"tok_s={ts!r}\n{out.stderr}")
+            line = rate_line(out.stdout, "Generate")
+            self.assertEqual(line, base)   # byte-identical to the idle run: port never appears here
+            self.assertIn("last ", line)
+            self.assertNotIn("in flight", line)
 
 
 BASALT_ENGINE = {"version": "0.4.1", "quant": "Q4_K_XL", "kv": "fp16"}
