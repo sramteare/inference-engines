@@ -238,28 +238,20 @@ def render():
     psuf = gsuf = ""     # "in flight" suffixes, only ever set together with their override
     if ENGINE == "maya":   # Maya's counters only move when a request ends: lv and state are set above
         ptk = lv.get("prompt_tokens")   # the current request's prompt length, set the moment it starts
-        # A request is identified across frames by its start time: elapsed_s is time since it started.
-        start = time.time() - lv["elapsed_s"] if is_num(lv.get("elapsed_s")) else None
-        pm = PREV.get("maya_prefill")   # (start, rate): first positive prefill rate of a request
         pv = lv.get("prefill_tok_s_mean")
         # just after a request starts, live still holds the previous request's reading values: they
-        # always end with prompt_read == prompt_total, so require a still-growing read
+        # always end with prompt_read == prompt_total, so require a still-growing read;
+        # a negative prompt_read means there is no live prefill at all
         reading = (is_num(ptk) and lv.get("prompt_total") == ptk
                    and is_num(lv.get("prompt_total")) and is_num(lv.get("prompt_read"))
-                   and lv["prompt_read"] < lv["prompt_total"])
-        if start is not None and is_num(pv) and pv > 0 and ((state == "reading" and reading) or state == "generating"):
-            if not (pm and abs(start - pm[0]) < 2):   # a new request replaces the memo
-                pm = PREV["maya_prefill"] = (start, pv)
+                   and 0 <= lv["prompt_read"] < lv["prompt_total"])
         if state == "reading" and reading and is_num(pv) and pv > 0:
             pnow = pv
             pr, pt, ru = lv.get("prompt_read"), ptk, lv.get("prompt_reused")
-            if is_num(pr) and pr >= 0:
-                if is_num(ru) and ru > 0:   # prompt_read includes the cached prefix: count only fresh tokens
-                    pr, pt = max(pr - ru, 0), max(pt - ru, 0)
-                psuf = f", +{num(pr)}/{num(pt)} in flight"
+            if is_num(ru) and 0 < ru < pt:   # prompt_read includes the cached prefix: count only fresh tokens
+                pr, pt = max(pr - ru, 0), max(pt - ru, 0)
+            psuf = f", +{num(pr)}/{num(pt)} in flight"
         elif state == "generating":
-            if start is not None and pm and abs(start - pm[0]) < 2:
-                pnow = pm[1]   # first prefill rate of this request, not a later noisy re-read
             ts = lv.get("tok_s")
             if is_num(ts) and ts >= 0:
                 gnow = ts
