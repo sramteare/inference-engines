@@ -350,18 +350,19 @@ class LlmStatsMayaTest(unittest.TestCase):
             self.assertIn("last ", line)
             self.assertNotIn("in flight", line)
 
-    def test_reading_same_length_stale_falls_back_to_idle_prefill_line(self):
+    def test_reading_finished_prompt_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
         self.assertEqual(idle.returncode, 0, idle.stderr)
         base = rate_line(idle.stdout, "Prefill")
-        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 40000,
-                "prompt_total": 40000, "prompt_tokens": 40000}
-        out = run_stats(self.serve(live=live))
-        self.assertEqual(out.returncode, 0, out.stderr)
-        pre = rate_line(out.stdout, "Prefill")
-        self.assertEqual(pre, base)   # stale: prompt_read == prompt_total
-        self.assertNotIn("now", pre)
-        self.assertNotIn("in flight", pre)
+        for read in [40000, 39999]:   # a finished read ends at total, or total - 1 with the last token held back
+            live = {"state": "reading", "prefill_tok_s_mean": 1300.0, "prompt_read": read,
+                    "prompt_total": 40000, "prompt_tokens": 40000}
+            out = run_stats(self.serve(live=live))
+            self.assertEqual(out.returncode, 0, f"prompt_read={read}\n{out.stderr}")
+            pre = rate_line(out.stdout, "Prefill")
+            self.assertEqual(pre, base)   # stale: the read can no longer grow
+            self.assertNotIn("now", pre)
+            self.assertNotIn("in flight", pre)
 
     def test_reading_non_positive_prefill_rate_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -412,14 +413,26 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertNotIn("now", pre)
         self.assertNotIn("in flight", pre)
 
-    def test_reading_reused_past_total_does_not_subtract(self):
-        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 200000,
-                "prompt_read": 100500, "prompt_total": 102000, "prompt_tokens": 102000}
+    def test_reading_reused_covering_the_prompt_shows_now_without_in_flight(self):
+        for ru, read, total in [(40000, 20000, 40000),    # reused == total
+                                (200000, 100500, 102000)]:   # reused past total
+            live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": ru,
+                    "prompt_read": read, "prompt_total": total, "prompt_tokens": total}
+            out = run_stats(self.serve(live=live))
+            self.assertEqual(out.returncode, 0, f"prompt_reused={ru}\n{out.stderr}")
+            pre = rate_line(out.stdout, "Prefill")
+            self.assertIn("now ", pre)
+            self.assertIn("1234.5", pre)
+            self.assertNotIn("in flight", pre)   # nothing fresh left to count
+
+    def test_reading_reused_above_read_clamps_fresh_read_to_zero(self):
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 150,
+                "prompt_read": 100, "prompt_total": 200, "prompt_tokens": 200}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
-        self.assertIn("+100500/102000 in flight", pre)   # unsubtracted: reused is out of range
+        self.assertIn("+0/50 in flight", pre)
 
     def test_generating_negative_tok_s_falls_back_to_idle_generate_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -441,6 +454,15 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("now ", gen)
         self.assertIn("0.0 tok/s", gen)
         self.assertIn("+3 in flight", gen)
+
+    def test_generating_negative_zero_tok_s_shows_zero(self):
+        body = '{"live": {"state": "generating", "tok_s": -0.0, "generated": 3}}'   # raw text: -0.0 survives parsing
+        out = run_stats(self.serve(metrics_body=body))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        gen = rate_line(out.stdout, "Generate")
+        self.assertIn("now ", gen)
+        self.assertIn("0.0 tok/s", gen)
+        self.assertNotIn("-0.0", gen)
 
     def test_generating_negative_generated_shows_now_without_in_flight(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": -1}

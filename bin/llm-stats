@@ -212,6 +212,7 @@ def render():
     lines.append("-" * 72)
     lines.append(f"Load       processing: {num(m.get('requests_processing'))}   "
                  f"queued: {num(m.get('requests_deferred'))}")
+    lv, state = {}, None   # Maya live block, so the prefill/generate block below never depends on the one above
     if ENGINE == "maya":
         lv = (eng or {}).get("live") or {}
         state = lv.get("state")
@@ -236,25 +237,29 @@ def render():
                 lines.append("Live       " + "  ".join(parts))
     pnow = gnow = None   # Maya live rate overrides: shown instead of "last" while a request runs
     psuf = gsuf = ""     # "in flight" suffixes, only ever set together with their override
-    if ENGINE == "maya":   # Maya's counters only move when a request ends: lv and state are set above
+    if ENGINE == "maya":   # Maya's counters only move when a request ends
         ptk = lv.get("prompt_tokens")   # the current request's prompt length, set the moment it starts
         pv = lv.get("prefill_tok_s_mean")
-        # just after a request starts, live still holds the previous request's reading values: they
-        # always end with prompt_read == prompt_total, so require a still-growing read;
+        # just after a request starts, live still holds the previous request's reading values: they end at
+        # prompt_total - 1 (the engine reads n-1 tokens and feeds the last one into the first decode step)
+        # or at prompt_total, so require a read still short of prompt_total - 1;
         # a negative prompt_read means there is no live prefill at all
         reading = (is_num(ptk) and lv.get("prompt_total") == ptk
                    and is_num(lv.get("prompt_total")) and is_num(lv.get("prompt_read"))
-                   and 0 <= lv["prompt_read"] < lv["prompt_total"])
+                   and 0 <= lv["prompt_read"] < lv["prompt_total"] - 1)
         if state == "reading" and reading and is_num(pv) and pv > 0:
             pnow = pv
             pr, pt, ru = lv.get("prompt_read"), ptk, lv.get("prompt_reused")
-            if is_num(ru) and 0 < ru < pt:   # prompt_read includes the cached prefix: count only fresh tokens
-                pr, pt = max(pr - ru, 0), max(pt - ru, 0)
-            psuf = f", +{num(pr)}/{num(pt)} in flight"
+            if is_num(ru) and ru >= pt:   # the whole prompt is cached: nothing fresh left to count
+                psuf = ""
+            else:
+                if is_num(ru) and 0 < ru < pt:   # prompt_read includes the cached prefix: count only fresh tokens
+                    pr, pt = max(pr - ru, 0), max(pt - ru, 0)
+                psuf = f", +{num(pr)}/{num(pt)} in flight"
         elif state == "generating":
             ts = lv.get("tok_s")
             if is_num(ts) and ts >= 0:
-                gnow = ts
+                gnow = ts if ts else 0.0   # -0.0 would render "-0.0"
                 if is_num(lv.get("generated")) and lv["generated"] >= 0:
                     gsuf = f", +{num(lv['generated'])} in flight"
     lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"), now=pnow)
