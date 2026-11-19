@@ -82,7 +82,11 @@ def metrics():
     if ENGINE == "basalt":
         return basalt_metrics()
     if ENGINE == "maya":
-        return prom_metrics("/metrics/prometheus"), None   # Maya's Prometheus text
+        try:
+            eng = get("/metrics")   # Maya's JSON /metrics: live + engine blocks (once per frame)
+        except Exception:
+            eng = None              # tolerate absence: no live line / header extras
+        return prom_metrics("/metrics/prometheus"), eng    # counters come from the Prometheus text
     return prom_metrics("/metrics"), None
 
 
@@ -183,10 +187,36 @@ def render():
         extra = ", ".join(x for x in [f"basalt {e['version']}" if e.get("version") else "",
                                       e.get("quant") or "", f"kv {e['kv']}" if e.get("kv") else ""] if x)
         head += f"   {extra}" if extra else ""
+    elif ENGINE == "maya":
+        e = (eng or {}).get("engine") or {}
+        extra = ", ".join(x for x in [e.get("model_label") or "", e.get("version") or "",
+                                      f"kv {e['kv']}" if e.get("kv") else ""] if x)
+        head += f"   {extra}" if extra else ""
     lines.append(head)
     lines.append("-" * 72)
     lines.append(f"Load       processing: {num(m.get('requests_processing'))}   "
                  f"queued: {num(m.get('requests_deferred'))}")
+    if ENGINE == "maya":
+        lv = (eng or {}).get("live") or {}
+        if lv.get("state") and lv["state"] != "idle":   # live progress while generating
+            parts = [lv["phase"]] if lv.get("phase") else []
+            pr, pt = lv.get("prompt_read"), lv.get("prompt_total")
+            if pr is not None and pt is not None:
+                parts.append(f"prompt {num(pr)}/{num(pt)} tok")
+            elif lv.get("generated") is not None:
+                g = f"generated {num(lv['generated'])}"
+                if lv.get("max_tokens") is not None:
+                    g += f"/{num(lv['max_tokens'])}"
+                parts.append(g + " tok")
+            if lv.get("tok_s") is not None:
+                r = f"{lv['tok_s']:.1f} tok/s now"
+                if lv.get("tok_s_mean") is not None:
+                    r += f" (mean {lv['tok_s_mean']:.1f})"
+                parts.append(r)
+            if lv.get("elapsed_s") is not None:
+                parts.append(f"elapsed {lv['elapsed_s']:.1f} s")
+            if parts:
+                lines.append("Live       " + "  ".join(parts))
     lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"))
                  + f"   ({num(m.get('prompt_tokens_total'))} tok, "
                  f"{num(m.get('prompt_tokens_cached_total'))} cached)")
