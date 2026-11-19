@@ -1,6 +1,9 @@
 """llm-stats against stub Maya, Basalt and llama.cpp servers."""
+import contextlib
+import io
 import json
 import os
+import runpy
 import subprocess
 import sys
 import threading
@@ -267,13 +270,16 @@ class LlmStatsMayaTest(unittest.TestCase):
             self.assertEqual(line, base)
             self.assertNotIn("in flight", line)
 
-    def test_reading_missing_prompt_read_shows_now_without_in_flight(self):
+    def test_reading_missing_prompt_read_falls_back_to_idle_prefill_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Prefill")
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_total": 40000, "prompt_tokens": 40000}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
-        self.assertIn("now ", pre)
-        self.assertIn("1234.5", pre)
+        self.assertEqual(pre, base)
+        self.assertNotIn("now", pre)
         self.assertNotIn("in flight", pre)
 
     def test_generating_generate_shows_now_rate_and_in_flight(self):
@@ -296,8 +302,9 @@ class LlmStatsMayaTest(unittest.TestCase):
                          "Generate   now      31.2 tok/s   avg        - tok/s   (- tok, +412 in flight)")
 
     def test_generating_prefill_shows_mean_as_now(self):
-        # prefill_tok_s_mean stays set for the whole request: show it, not the previous request's "last"
-        live = {"state": "generating", "tok_s": 31.2, "generated": 412, "prefill_tok_s_mean": 1500.0}
+        # the request's first prefill_tok_s_mean is memoised for the whole request: show it, not "last"
+        live = {"state": "generating", "tok_s": 31.2, "generated": 412, "prefill_tok_s_mean": 1500.0,
+                "elapsed_s": 10.0}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
@@ -341,6 +348,112 @@ class LlmStatsMayaTest(unittest.TestCase):
             self.assertEqual(line, base)   # byte-identical to the idle run: port never appears here
             self.assertIn("last ", line)
             self.assertNotIn("in flight", line)
+
+    def test_reading_same_length_stale_falls_back_to_idle_prefill_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Prefill")
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 40000,
+                "prompt_total": 40000, "prompt_tokens": 40000}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertEqual(pre, base)   # stale: prompt_read == prompt_total
+        self.assertNotIn("now", pre)
+        self.assertNotIn("in flight", pre)
+
+    def test_reading_non_positive_prefill_rate_falls_back_to_idle_prefill_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Prefill")
+        for pv in [0, -5]:
+            live = {"state": "reading", "prefill_tok_s_mean": pv, "prompt_read": 100,
+                    "prompt_total": 200, "prompt_tokens": 200}
+            out = run_stats(self.serve(live=live))
+            self.assertEqual(out.returncode, 0, f"prefill={pv!r}\n{out.stderr}")
+            pre = rate_line(out.stdout, "Prefill")
+            self.assertEqual(pre, base)
+            self.assertNotIn("now", pre)
+            self.assertNotIn("in flight", pre)
+
+    def test_reading_prompt_read_past_total_falls_back_to_idle_prefill_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Prefill")
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 50000,
+                "prompt_total": 40000, "prompt_tokens": 40000}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertEqual(pre, base)
+        self.assertNotIn("now", pre)
+        self.assertNotIn("in flight", pre)
+
+    def test_reading_negative_reused_does_not_subtract(self):
+        live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": -1,
+                "prompt_read": 100, "prompt_total": 200, "prompt_tokens": 200}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIn("now ", pre)
+        self.assertIn("+100/200 in flight", pre)
+
+    def test_generating_negative_tok_s_falls_back_to_idle_generate_line(self):
+        idle = run_stats(self.serve(live={"state": "idle"}))
+        self.assertEqual(idle.returncode, 0, idle.stderr)
+        base = rate_line(idle.stdout, "Generate")
+        live = {"state": "generating", "tok_s": -1, "generated": 412}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        gen = rate_line(out.stdout, "Generate")
+        self.assertEqual(gen, base)
+        self.assertIn("last ", gen)
+        self.assertNotIn("in flight", gen)
+
+    def test_generating_zero_tok_s_shows_now(self):
+        live = {"state": "generating", "tok_s": 0.0, "generated": 3}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        gen = rate_line(out.stdout, "Generate")
+        self.assertIn("now ", gen)
+        self.assertIn("0.0 tok/s", gen)
+        self.assertIn("+3 in flight", gen)
+
+    def test_generating_negative_generated_shows_now_without_in_flight(self):
+        live = {"state": "generating", "tok_s": 31.2, "generated": -1}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        gen = rate_line(out.stdout, "Generate")
+        self.assertIn("now ", gen)
+        self.assertIn("31.2", gen)
+        self.assertNotIn("in flight", gen)
+
+    def test_generating_prefill_rate_sticky_per_request(self):
+        live = {"state": "generating", "tok_s": 31.2, "generated": 100,
+                "elapsed_s": 10.0, "prefill_tok_s_mean": 1500.0}
+        port = self.serve(live=live)
+        argv = sys.argv
+        sys.argv = ["llm-stats", "--once", "--port", str(port), "--host", "127.0.0.1"]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                ns = runpy.run_path(str(SCRIPT), run_name="llm_stats_sticky")
+        finally:
+            sys.argv = argv
+        render = ns["render"]
+        self.assertIn("1500.0", rate_line(render(), "Prefill"))
+        # same request, a later engine call re-reads only a few tokens: keep the first rate
+        live.update({"elapsed_s": 12.0, "prefill_tok_s_mean": 95.3})
+        pre = rate_line(render(), "Prefill")
+        self.assertIn("1500.0", pre)
+        self.assertNotIn("95.3", pre)
+        # a new request replaces the memo
+        live.update({"elapsed_s": 1.0, "prefill_tok_s_mean": 800.0})
+        self.assertIn("800.0", rate_line(render(), "Prefill"))
+        # without elapsed_s a generating request has no Prefill "now"
+        live.pop("elapsed_s")
+        pre = rate_line(render(), "Prefill")
+        self.assertTrue(pre.startswith("Prefill    last "), pre)
+        self.assertNotIn("now", pre)
 
 
 BASALT_ENGINE = {"version": "0.4.1", "quant": "Q4_K_XL", "kv": "fp16"}
