@@ -160,8 +160,9 @@ def num(v):
 
 
 def is_num(v):
-    # finite int/float only: no bool, NaN or Infinity (JSON 1e309) reaching num() or ":.1f"
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    # finite int/float only: no bool, NaN or Infinity (JSON 1e309) reaching num() or ":.1f";
+    # abs(v) < 1e18 first so isfinite never sees a huge int (OverflowError on a 400-digit JSON number)
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 1e18 and math.isfinite(v)
 
 
 def render():
@@ -210,8 +211,8 @@ def render():
     if ENGINE == "maya":
         lv = (eng or {}).get("live") or {}
         state = lv.get("state")
-        if isinstance(state, str) and state != "idle":   # live progress while generating
-            parts = [lv["phase"]] if isinstance(lv.get("phase"), str) else []
+        if isinstance(state, str) and state and state != "idle":   # live progress while generating; "" = no request
+            parts = [lv["phase"]] if isinstance(lv.get("phase"), str) and lv["phase"] else []
             pr, pt = lv.get("prompt_read"), lv.get("prompt_total")
             if state == "reading" and is_num(pr) and is_num(pt):
                 parts.append(f"prompt {num(pr)}/{num(pt)} tok")   # Maya sets these only while reading

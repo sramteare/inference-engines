@@ -137,6 +137,25 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("generated 2000/8000 tok", line)
         self.assertNotIn("1", line)   # a leaked phase would render str(1) = "1"
 
+    def test_empty_state_has_no_live_line(self):
+        out = run_stats(self.serve(live={"state": "", "generated": 5}))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Maya", out.stdout)
+        self.assertNotIn("Live", out.stdout)
+
+    def test_empty_phase_has_no_blank_segment(self):
+        out = run_stats(self.serve(live={"state": "generating", "phase": "", "generated": 5}))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(live_line(out.stdout), "Live       generated 5 tok")
+
+    def test_huge_int_generated_never_renders(self):
+        body = '{"live": {"state": "generating", "phase": "thinking", "generated": %s}}' % ("9" * 400)
+        out = run_stats(self.serve(metrics_body=body))
+        self.assertEqual(out.returncode, 0, f"raw=400-digit int\n{out.stdout}\n{out.stderr}")
+        line = live_line(out.stdout)
+        self.assertIn("thinking", line)
+        self.assertNotIn("generated", line)
+
     def test_unlimited_max_tokens_has_no_slash(self):
         for mx in (0, -1):
             live = {"state": "generating", "generated": 10, "max_tokens": mx,
