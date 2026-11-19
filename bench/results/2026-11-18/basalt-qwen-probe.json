@@ -1,0 +1,34 @@
+[
+ {
+  "q": "What is 17 * 23? Reply with just the number.",
+  "answer": "391",
+  "reasoning_len": 143,
+  "s": 0.3
+ },
+ {
+  "q": "How many ways can 8 rooks be placed on an 8x8 board so none attack each other? Give the number and one-line reason.",
+  "answer": "\\(8! = 40320\\), since each row must contain exactly one rook and the columns form a permutation of 1\u20138.",
+  "reasoning_len": 722,
+  "s": 1.0
+ },
+ {
+  "q": "Write a Python function is_prime(n) in 6 lines or fewer. Code only.",
+  "answer": "def is_prime(n):\n    if n < 2: return False\n    if n % 2 == 0: return n == 2\n    return all(n % i for i in range(3, int(n**0.5) + 1, 2))",
+  "reasoning_len": 637,
+  "s": 1.2
+ },
+ {
+  "words": 94000,
+  "answer": "Release codename: VIOLET-7243; Owner: Tamsin Okafor",
+  "ok": true,
+  "s": 18.9,
+  "usage": {
+   "prompt_tokens": 145203,
+   "completion_tokens": 94,
+   "total_tokens": 145297,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  }
+ }
+]

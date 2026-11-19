@@ -1,0 +1,21 @@
+basalt-bench: starting the engine for the quality gate
+basalt-bench: loading 77.5 GiB
+basalt-bench: engine: warning: the device-planned MoE tail is off: every expert is resident
+basalt-bench: loading weights 77.5 / 77.5 GiB done (8 s)
+basalt-bench: engine ready in 10 s
+  quality 10/100 chunks, 13 s
+  quality 20/100 chunks, 26 s
+  quality 30/100 chunks, 38 s
+  quality 40/100 chunks, 50 s
+  quality 50/100 chunks, 62 s
+  quality 60/100 chunks, 74 s
+  quality 70/100 chunks, 86 s
+  quality 80/100 chunks, 99 s
+  quality 90/100 chunks, 111 s
+  quality 100/100 chunks, 123 s
+
+quality gate: 100 chunks asked, T=3
+chunks 100  rows 25500
+PPL 3.3308 +/- 0.0441   base PPL 3.3233   ln(PPL/base) 0.00225
+KLD mean 0.03118  median 0.00684  p99 0.3874  max 3.1040
+same top-1 94.22%   mean |dlogp| of the base top-1 0.08033

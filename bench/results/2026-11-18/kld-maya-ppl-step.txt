@@ -1,0 +1,14 @@
+ds4: WARNING - CUDA0: 3.0 of its 102.0 GB already in use as the engine starts (other programs: nvidia-smi lists them) - what they hold is not planned for experts
+ds4: the one-GPU decode path (in-place pulls, windows streamed, landings): off (v1.1.27's path: this GPU's PCIe lane streamed nothing at an earlier start - lane-times.txt in the pack; delete it to measure again)
+ds4: DS4_AR2=1: no group of two takes prompt chunks - not used
+ds4: CUDA0 prompt ring: 28 slots of 13.4 MB, 7 a batch (377 MB) for its 56.9 GB/s link (DS4_RING_MB sets it)
+ds4: the experts VRAM leaves over (~105.4 GB) are read in place from the model's files (copied into RAM after the GPUs' share when the RAM holds them all; --mmap-experts on keeps them in place) (110.7 GB of RAM free to keep them: the most-routed 102.1 GB read ahead; prompts in chunks of 32768)
+ds4: CUDA0 layers [0, 39] + head: weights 7.77 GB, experts 85.76 GB (6782 of 15360 in VRAM), caches 0.01 GB, 3038 MiB free
+ds4: 8578 routed experts on the CPU lane (105.9 GB, in place in the model's files), 16 threads
+ds4: CPU lane iq2_xs rows: AVX-512 (VPOPCNTDQ)
+ppl: sequence 0, 512 tokens: 1.5485
+ppl: sequence 1, 512 tokens: 6.3905
+ppl: sequence 2, 512 tokens: 3.8335
+ppl: sequence 3, 512 tokens: 1.5584
+ppl: sequence 4, 512 tokens: 1.8164
+perplexity 2.5479 over 2555 tokens of 5 sequences

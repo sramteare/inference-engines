@@ -1,0 +1,147 @@
+[
+  {
+    "label": "q-win-np1",
+    "cases": [
+      {
+        "stage": "cold",
+        "name": "cold_warm_probe",
+        "prompt_n": 80,
+        "prompt_tps": 250.98669143068688,
+        "prompt_ms": 318.742,
+        "gen_n": 512,
+        "gen_tps": 134.78173140453904,
+        "gen_ms": 3791.315,
+        "wall_s": 4.11225709199789,
+        "draft_acc_pct": 55.05154639175258
+      },
+      {
+        "stage": "warm",
+        "name": "rust_spsc",
+        "prompt_n": 80,
+        "prompt_tps": 585.6429627677486,
+        "prompt_ms": 136.602,
+        "gen_n": 512,
+        "gen_tps": 157.7646447887343,
+        "gen_ms": 3239.002,
+        "wall_s": 3.3988067229947774,
+        "draft_acc_pct": 71.42857142857143
+      },
+      {
+        "stage": "warm",
+        "name": "sql_orderbook",
+        "prompt_n": 77,
+        "prompt_tps": 612.6329692012698,
+        "prompt_ms": 125.687,
+        "gen_n": 512,
+        "gen_tps": 137.27842697727948,
+        "gen_ms": 3722.362,
+        "wall_s": 3.870159373000206,
+        "draft_acc_pct": 55.1440329218107
+      },
+      {
+        "stage": "warm",
+        "name": "math_combinatorics",
+        "prompt_n": 94,
+        "prompt_tps": 721.3014119091467,
+        "prompt_ms": 130.32,
+        "gen_n": 512,
+        "gen_tps": 178.39245012429868,
+        "gen_ms": 2864.471,
+        "wall_s": 3.0172214660051395,
+        "draft_acc_pct": 87.6010781671159
+      },
+      {
+        "stage": "warm",
+        "name": "linux_nvme",
+        "prompt_n": 76,
+        "prompt_tps": 602.4239637911492,
+        "prompt_ms": 126.157,
+        "gen_n": 512,
+        "gen_tps": 135.7827009118964,
+        "gen_ms": 3763.366,
+        "wall_s": 3.913565369002754,
+        "draft_acc_pct": 53.86178861788618
+      },
+      {
+        "stage": "warm",
+        "name": "python_async",
+        "prompt_n": 73,
+        "prompt_tps": 583.4958595773252,
+        "prompt_ms": 125.108,
+        "gen_n": 512,
+        "gen_tps": 153.07756299321457,
+        "gen_ms": 3338.177,
+        "wall_s": 3.4869924430022365,
+        "draft_acc_pct": 68.997668997669
+      },
+      {
+        "stage": "long",
+        "name": "long_5500w",
+        "prompt_n": 8350,
+        "prompt_tps": 4109.490610183071,
+        "prompt_ms": 2031.882,
+        "gen_n": 512,
+        "gen_tps": 140.93938999446172,
+        "gen_ms": 3625.672,
+        "wall_s": 5.690060048997111,
+        "draft_acc_pct": 65.9090909090909
+      },
+      {
+        "stage": "concurrent",
+        "name": "rust_spsc_1",
+        "prompt_n": 80,
+        "prompt_tps": 638.7888563284014,
+        "prompt_ms": 125.237,
+        "gen_n": 512,
+        "gen_tps": 158.93934271272445,
+        "gen_ms": 3215.063,
+        "wall_s": 3.399640728996019,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "concurrent",
+        "name": "sql_orderbook_2",
+        "prompt_n": 77,
+        "prompt_tps": 596.6263491891306,
+        "prompt_ms": 129.059,
+        "gen_n": 512,
+        "gen_tps": 136.4315487410385,
+        "gen_ms": 3745.468,
+        "wall_s": 14.13884194399725,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "concurrent",
+        "name": "math_combinatorics_3",
+        "prompt_n": 94,
+        "prompt_tps": 709.4446708629564,
+        "prompt_ms": 132.498,
+        "gen_n": 512,
+        "gen_tps": 179.60767497689,
+        "gen_ms": 2845.09,
+        "wall_s": 6.377057192003122,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "concurrent",
+        "name": "linux_nvme_4",
+        "prompt_n": 76,
+        "prompt_tps": 576.6050103940639,
+        "prompt_ms": 131.806,
+        "gen_n": 512,
+        "gen_tps": 136.1508476789078,
+        "gen_ms": 3753.19,
+        "wall_s": 10.263188316996093,
+        "draft_acc_pct": null
+      }
+    ],
+    "concurrent": {
+      "n_requests": 4,
+      "wall_s": 14.141443491003884,
+      "gen_n": 2048,
+      "gen_tps": 144.82255657301468,
+      "median_gen_tps": 147.68544572688148,
+      "draft_acc_pct": 65.20022560631698
+    }
+  }
+]

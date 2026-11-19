@@ -1,0 +1,103 @@
+[
+  {
+    "label": "http://127.0.0.1:8010",
+    "cases": [
+      {
+        "stage": "cold",
+        "name": "cold_warm_probe",
+        "prompt_n": 57,
+        "prompt_tps": 5.257069305604783,
+        "prompt_ms": 10842.543,
+        "gen_n": 512,
+        "gen_tps": 18.765685735431077,
+        "gen_ms": 27230.553,
+        "wall_s": 38.10962969600223,
+        "draft_acc_pct": 39.20454545454545
+      },
+      {
+        "stage": "warm",
+        "name": "rust_spsc",
+        "prompt_n": 59,
+        "prompt_tps": 38.994059023787045,
+        "prompt_ms": 1513.051,
+        "gen_n": 512,
+        "gen_tps": 23.760665097749794,
+        "gen_ms": 21506.132,
+        "wall_s": 23.05718456100294,
+        "draft_acc_pct": 63.13799621928166
+      },
+      {
+        "stage": "warm",
+        "name": "sql_orderbook",
+        "prompt_n": 55,
+        "prompt_tps": 60.58116058083013,
+        "prompt_ms": 907.873,
+        "gen_n": 512,
+        "gen_tps": 25.59501266903039,
+        "gen_ms": 19964.827,
+        "wall_s": 20.888143891002983,
+        "draft_acc_pct": 42.15976331360947
+      },
+      {
+        "stage": "warm",
+        "name": "math_combinatorics",
+        "prompt_n": 69,
+        "prompt_tps": 39.55936599522765,
+        "prompt_ms": 1744.214,
+        "gen_n": 512,
+        "gen_tps": 31.196577387475287,
+        "gen_ms": 16380.002,
+        "wall_s": 18.13670440900023,
+        "draft_acc_pct": 73.94957983193277
+      },
+      {
+        "stage": "warm",
+        "name": "linux_nvme",
+        "prompt_n": 55,
+        "prompt_tps": 102.51745592681372,
+        "prompt_ms": 536.494,
+        "gen_n": 512,
+        "gen_tps": 30.103128251108394,
+        "gen_ms": 16974.98,
+        "wall_s": 17.523199465998914,
+        "draft_acc_pct": 47.77777777777778
+      },
+      {
+        "stage": "warm",
+        "name": "python_async",
+        "prompt_n": 56,
+        "prompt_tps": 90.99077581010226,
+        "prompt_ms": 615.447,
+        "gen_n": 512,
+        "gen_tps": 32.352364479838876,
+        "gen_ms": 15794.827,
+        "wall_s": 16.422332620000816,
+        "draft_acc_pct": 65.95330739299611
+      },
+      {
+        "stage": "long",
+        "name": "long_5500w",
+        "prompt_n": 7555,
+        "prompt_tps": 160.92111887442206,
+        "prompt_ms": 46948.468,
+        "gen_n": 512,
+        "gen_tps": 39.63630471429244,
+        "gen_ms": 12892.221,
+        "wall_s": 59.8932708450011,
+        "draft_acc_pct": 50.32786885245902
+      },
+      {
+        "stage": "long",
+        "name": "long_22000w",
+        "prompt_n": 30104,
+        "prompt_tps": 192.9237696625283,
+        "prompt_ms": 156040.907,
+        "gen_n": 512,
+        "gen_tps": 40.64313829293092,
+        "gen_ms": 12572.848,
+        "wall_s": 168.6661713509966,
+        "draft_acc_pct": 50.82508250825082
+      }
+    ]
+  }
+]

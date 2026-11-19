@@ -1,0 +1,48 @@
+[
+ {
+  "q": "What is 17 * 23? Reply with just the number.",
+  "answer": "391",
+  "reasoning_len": 57,
+  "s": 1.0
+ },
+ {
+  "q": "How many ways can 8 rooks be placed on an 8x8 board so none attack each other? Give the number and one-line reason.",
+  "answer": "\\[\n8! = 40320\n\\]\n\nOne-line reason: each row must contain exactly one rook in a distinct column, giving a permutation of the 8 columns.",
+  "reasoning_len": 701,
+  "s": 6.1
+ },
+ {
+  "q": "Write a Python function is_prime(n) in 6 lines or fewer. Code only.",
+  "answer": "def is_prime(n):\n    if n < 2: return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0: return False\n    return True",
+  "reasoning_len": 603,
+  "s": 7.1
+ },
+ {
+  "words": 94000,
+  "answer": "Release codename: VIOLET-7243; owner: Tamsin Okafor.",
+  "ok": true,
+  "s": 32.0,
+  "usage": {
+   "prompt_tokens": 129242,
+   "completion_tokens": 67,
+   "total_tokens": 129309,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  }
+ },
+ {
+  "words": 180000,
+  "answer": "Release codename: VIOLET-7243; owner: Tamsin Okafor.",
+  "ok": true,
+  "s": 64.9,
+  "usage": {
+   "prompt_tokens": 248272,
+   "completion_tokens": 64,
+   "total_tokens": 248336,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  }
+ }
+]

@@ -1,0 +1,91 @@
+[
+  {
+    "label": "http://127.0.0.1:8010",
+    "cases": [
+      {
+        "stage": "cold",
+        "name": "cold_warm_probe",
+        "prompt_n": 57,
+        "prompt_tps": 4.182565306721456,
+        "prompt_ms": 13628.0,
+        "gen_n": 512,
+        "gen_tps": 20.76981215513627,
+        "gen_ms": 24603.015,
+        "wall_s": 38.23641922800016,
+        "draft_acc_pct": 40.25974025974026
+      },
+      {
+        "stage": "warm",
+        "name": "rust_spsc",
+        "prompt_n": 59,
+        "prompt_tps": 12.797878762440785,
+        "prompt_ms": 4610.139,
+        "gen_n": 512,
+        "gen_tps": 28.357770961553744,
+        "gen_ms": 18019.752,
+        "wall_s": 22.64001595800073,
+        "draft_acc_pct": 64.0
+      },
+      {
+        "stage": "warm",
+        "name": "sql_orderbook",
+        "prompt_n": 55,
+        "prompt_tps": 15.675321344087555,
+        "prompt_ms": 3508.7,
+        "gen_n": 512,
+        "gen_tps": 33.49157830996253,
+        "gen_ms": 15257.567,
+        "wall_s": 18.77191814500111,
+        "draft_acc_pct": 48.87096774193548
+      },
+      {
+        "stage": "warm",
+        "name": "math_combinatorics",
+        "prompt_n": 69,
+        "prompt_tps": 8.784928525694198,
+        "prompt_ms": 7854.361,
+        "gen_n": 512,
+        "gen_tps": 34.40550585048458,
+        "gen_ms": 14852.274,
+        "wall_s": 22.712506199000927,
+        "draft_acc_pct": 61.52416356877323
+      },
+      {
+        "stage": "warm",
+        "name": "linux_nvme",
+        "prompt_n": 55,
+        "prompt_tps": 17.58045053900063,
+        "prompt_ms": 3128.475,
+        "gen_n": 512,
+        "gen_tps": 25.071055098917824,
+        "gen_ms": 20382.07,
+        "wall_s": 23.516254595000646,
+        "draft_acc_pct": 48.792270531400966
+      },
+      {
+        "stage": "warm",
+        "name": "python_async",
+        "prompt_n": 56,
+        "prompt_tps": 18.79851948231563,
+        "prompt_ms": 2978.958,
+        "gen_n": 512,
+        "gen_tps": 33.87104332689739,
+        "gen_ms": 15086.633,
+        "wall_s": 18.07097502000397,
+        "draft_acc_pct": 70.67209775967413
+      },
+      {
+        "stage": "long",
+        "name": "long_93500w",
+        "prompt_n": 128477,
+        "prompt_tps": 159.8854162274216,
+        "prompt_ms": 803556.716,
+        "gen_n": 512,
+        "gen_tps": 24.441412093735064,
+        "gen_ms": 20907.139,
+        "wall_s": 824.6140387100022,
+        "draft_acc_pct": 45.736434108527135
+      }
+    ]
+  }
+]
