@@ -5,7 +5,7 @@ Usage: llm-stats [--port 8000] [--host localhost] [--interval 1] [--once] [--eng
 --engine auto (default) detects the engine from /health and /v1/status, and re-detects if the server goes away or changes.
 Requires llama-server started with --metrics (llm-serve does this).
 """
-import argparse, json, re, subprocess, sys, time, urllib.request
+import argparse, json, math, re, subprocess, sys, time, urllib.request
 
 p = argparse.ArgumentParser()
 p.add_argument("--host", default="localhost")
@@ -160,7 +160,8 @@ def num(v):
 
 
 def is_num(v):
-    return isinstance(v, (int, float))   # guard a malformed /metrics against ":.1f"
+    # finite int/float only: no bool, NaN or Infinity (JSON 1e309) reaching num() or ":.1f"
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def render():
@@ -208,10 +209,11 @@ def render():
                  f"queued: {num(m.get('requests_deferred'))}")
     if ENGINE == "maya":
         lv = (eng or {}).get("live") or {}
-        if lv.get("state") and lv["state"] != "idle":   # live progress while generating
-            parts = [str(lv["phase"])] if lv.get("phase") else []
+        state = lv.get("state")
+        if isinstance(state, str) and state != "idle":   # live progress while generating
+            parts = [lv["phase"]] if isinstance(lv.get("phase"), str) else []
             pr, pt = lv.get("prompt_read"), lv.get("prompt_total")
-            if lv.get("state") == "reading" and is_num(pr) and is_num(pt):
+            if state == "reading" and is_num(pr) and is_num(pt):
                 parts.append(f"prompt {num(pr)}/{num(pt)} tok")   # Maya sets these only while reading
             elif is_num(lv.get("generated")):
                 g = f"generated {num(lv['generated'])}"

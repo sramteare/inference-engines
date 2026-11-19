@@ -3,7 +3,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -55,7 +54,8 @@ class MayaServer(HTTPServer):
 class MayaHandler(StubHandler):
     def do_GET(self):
         if self.path == "/metrics" and self.server.metrics_body is not None:
-            self.respond({"/metrics": json.dumps(self.server.metrics_body)})
+            body = self.server.metrics_body      # a str is served verbatim: raw/invalid JSON text
+            self.respond({"/metrics": body if isinstance(body, str) else json.dumps(body)})
             return
         routes = {
             "/health": {"status": "ok"},
@@ -74,19 +74,6 @@ def run_stats(port, script=SCRIPT):
     return subprocess.run(
         [sys.executable, str(script), "--once", "--port", str(port), "--host", "127.0.0.1"],
         capture_output=True, text=True, timeout=30, env=ENV)
-
-
-def run_main_stats(port):
-    """Run main's bin/llm-stats (straight from git) against the same stub."""
-    src = subprocess.run(["git", "show", "main:bin/llm-stats"], capture_output=True, text=True,
-                         check=True, cwd=str(ROOT)).stdout
-    fd, path = tempfile.mkstemp(suffix="-llm-stats-main")
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(src)
-        return run_stats(port, Path(path))
-    finally:
-        os.unlink(path)
 
 
 class LlmStatsMayaTest(unittest.TestCase):
@@ -126,6 +113,30 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("generated 120/500 tok", line)
         self.assertNotIn("tok/s now", line)
 
+    def test_reading_prompt_wins_over_generated(self):
+        live = {"state": "reading", "prompt_read": 10, "prompt_total": 20, "generated": 5}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        line = live_line(out.stdout)
+        self.assertIn("prompt 10/20 tok", line)
+        self.assertNotIn("generated", line)
+
+    def test_generating_generated_wins_over_prompt(self):
+        live = {"state": "generating", "prompt_read": 10, "prompt_total": 20, "generated": 5}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        line = live_line(out.stdout)
+        self.assertIn("generated 5", line)
+        self.assertNotIn("prompt", line)
+
+    def test_non_string_phase_omitted(self):
+        live = {"state": "generating", "phase": 1, "generated": 2000, "max_tokens": 8000}
+        out = run_stats(self.serve(live=live))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        line = live_line(out.stdout)
+        self.assertIn("generated 2000/8000 tok", line)
+        self.assertNotIn("1", line)   # a leaked phase would render str(1) = "1"
+
     def test_unlimited_max_tokens_has_no_slash(self):
         for mx in (0, -1):
             live = {"state": "generating", "generated": 10, "max_tokens": mx,
@@ -143,6 +154,22 @@ class LlmStatsMayaTest(unittest.TestCase):
             self.assertEqual(out.returncode, 0, f"body={body!r}\n{out.stdout}\n{out.stderr}")
             self.assertIn("Maya", out.stdout)
             self.assertIn("Prefill", out.stdout)
+
+    def test_non_finite_and_bool_generated_never_render(self):
+        for raw in ["1e309", "NaN", "true"]:   # raw JSON text: parses to inf, nan, True
+            body = '{"live": {"state": "generating", "phase": "thinking", "generated": %s}}' % raw
+            out = run_stats(self.serve(metrics_body=body))
+            self.assertEqual(out.returncode, 0, f"raw={raw}\n{out.stdout}\n{out.stderr}")
+            line = live_line(out.stdout)
+            for bad in ["inf", "nan", "generated"]:
+                self.assertNotIn(bad, line, f"raw={raw}\n{line}")
+
+    def test_invalid_json_metrics_body_renders_dashboard(self):
+        out = run_stats(self.serve(metrics_body='{"live":'))   # invalid JSON syntax
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Maya", out.stdout)
+        self.assertIn("Prefill", out.stdout)
+        self.assertNotIn("Live", out.stdout)
 
     def test_idle_has_no_live_line(self):
         out = run_stats(self.serve(live={"state": "idle", "generated": None, "tok_s": None}))
@@ -208,11 +235,12 @@ def serve(handler):
 
 
 class LlmStatsHeaderTest(unittest.TestCase):
+    # main@475d09b prints exactly these lines for these stubs (byte-identical to this branch)
     GOLDEN = {"basalt": "Basalt @ http://127.0.0.1:{port}   model: basalt-test   ctx: 8192"
                           "   basalt 0.4.1, Q4_K_XL, kv fp16",
               "llamacpp": "llama.cpp @ http://127.0.0.1:{port}   model: llama-test   ctx: 4096"}
 
-    def assert_head_matches_main(self, handler, golden):
+    def assert_header_unchanged(self, handler, golden):
         server = serve(handler)
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -220,18 +248,15 @@ class LlmStatsHeaderTest(unittest.TestCase):
         out = run_stats(port)
         self.assertEqual(out.returncode, 0, out.stderr)
         head = out.stdout.splitlines()[0]
-        self.assertEqual(head, golden.format(port=port))
-        main_out = run_main_stats(port)
-        self.assertEqual(main_out.returncode, 0, main_out.stderr)
-        self.assertEqual(head, main_out.stdout.splitlines()[0])   # byte-identical header to main
+        self.assertEqual(head, golden.format(port=port))   # byte-identical header to main
         return out
 
     def test_basalt_header_unchanged(self):
-        out = self.assert_head_matches_main(BasaltHandler, self.GOLDEN["basalt"])
+        out = self.assert_header_unchanged(BasaltHandler, self.GOLDEN["basalt"])
         self.assertNotIn("Live", out.stdout)
 
     def test_llamacpp_header_unchanged(self):
-        out = self.assert_head_matches_main(LlamaCppHandler, self.GOLDEN["llamacpp"])
+        out = self.assert_header_unchanged(LlamaCppHandler, self.GOLDEN["llamacpp"])
         self.assertIn("llama.cpp", out.stdout)
         self.assertNotIn("Live", out.stdout)
 
