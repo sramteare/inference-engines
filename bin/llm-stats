@@ -2,7 +2,7 @@
 """llm-stats - live dashboard for a running llama.cpp, Basalt or Maya server.
 
 Usage: llm-stats [--port 8000] [--host localhost] [--interval 1] [--once] [--engine auto]
---engine auto (default) detects the engine from /health and /v1/status.
+--engine auto (default) detects the engine from /health and /v1/status, and re-detects if the server goes away or changes.
 Requires llama-server started with --metrics (llm-serve does this).
 """
 import argparse, json, re, subprocess, sys, time, urllib.request
@@ -17,6 +17,8 @@ a = p.parse_args()
 BASE = f"http://{a.host}:{a.port}"
 NAMES = {"llamacpp": "llama.cpp", "basalt": "Basalt", "maya": "Maya"}
 ENGINE = None if a.engine == "auto" else a.engine  # None = not detected yet
+AUTO = a.engine == "auto"      # only auto mode may re-detect the engine after start
+LAST_DETECT = 0.0              # monotonic time of the last detect() in auto mode
 
 
 def get(path, as_json=True):
@@ -148,13 +150,23 @@ def num(v):
 
 
 def render():
-    global ENGINE
-    if ENGINE is None:
+    global ENGINE, LAST_DETECT
+    if AUTO and ENGINE is None:
         ENGINE = detect()  # retried every frame until the server answers
+        LAST_DETECT = time.monotonic()
+    elif AUTO and time.monotonic() - LAST_DETECT >= 5:
+        LAST_DETECT = time.monotonic()  # re-check even on success: the server may have been swapped
+        detected = detect()
+        if detected and detected != ENGINE:
+            ENGINE = detected
+            PREV.clear()
     try:
         m, eng = metrics()
     except Exception as e:
         hint = "\nIs llama-server running with --metrics?  (llm-serve)" if ENGINE in (None, "llamacpp") else ""
+        if AUTO:
+            ENGINE = None  # server may be restarting or swapped: re-detect next frame
+            PREV.clear()
         return f"Cannot reach {BASE} ({e}).{hint}"
     model, ctx = server_info()
     try:
