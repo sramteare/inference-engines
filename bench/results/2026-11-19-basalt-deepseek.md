@@ -130,15 +130,17 @@ phrases had already appeared.
   each is a small sample). Drafter on generated about 128 t/s against 72 t/s off.
 - **Maya, same prompt and sampling, 4 runs with its default thinking budget:** all 4 answered, but each one hit the
   budget (32,768 tokens), where Maya closes the reasoning and makes the model answer. Maya's log says "thinking reached its
-  budget" on all 4. These runs can't show whether Maya loops.
+  budget" on all 4. None looped before the cut-off, but the budget ends each run at 32k tokens, so these runs can't
+  rule out a later loop.
 - **Maya, 4 runs with the budget off** (`POST /api/thinking-budget {"budget": 0}`, which matches Basalt's no-cap
   setup): 3 answered, at 32-36k tokens, and 1 looped (93.6% repeats at word 14,811). Two of the 3 that answered went
   through loop phases (78% and 84% repeats) and recovered.
 - **Both engines loop, 1 run in 4 each, so the loops look like the model at these settings, not one engine** (small
   samples).
-  Maya's default thinking budget is what keeps its long reviews from running into `max_tokens`. Basalt can do the same
-  with `reasoning-budget-tokens` (a server default, 0 = none, which is our profile's setting) or a request's
-  `reasoning_budget_tokens`. Its `thinking-loop-tokens` only catches one token repeated in a row, not phrase loops.
+  Maya's default thinking budget would cut a loop like this off at 32k tokens instead of letting it run to
+  `max_tokens`. Basalt can do the same with `reasoning-budget-tokens` (a server default, 0 = none, which is our
+  profile's setting) or a request's `reasoning_budget_tokens`. Basalt's other cap, `answer-room` (by default thinking
+  stops a quarter of `max_tokens` early), is off in our profile (`answer-room 0`). Its `thinking-loop-tokens` only catches one token repeated in a row, not phrase loops.
 
 ## Not done yet
 
