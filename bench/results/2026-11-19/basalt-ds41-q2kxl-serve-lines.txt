@@ -1,0 +1,16 @@
+[server] s1 done  pp=57/0c 1.6s  tg=512 58.3t/s acc=69% dl=1.8  ttft=1.6s  end=length  hit=77.5%  pcie=0.0%  ssd=1.4%
+[server] s1 done  pp=59/0c 1.3s  tg=512 74.9t/s acc=81% dl=2.1  ttft=1.3s  end=length  hit=80.8%  pcie=0.0%  ssd=1.2%
+[server] s1 done  pp=55/0c 1.3s  tg=512 87.3t/s acc=80% dl=2.2  ttft=1.3s  end=length  hit=83.9%  pcie=0.0%  ssd=0.7%
+[server] s1 done  pp=69/0c 1.4s  tg=512 81.7t/s acc=79% dl=2.2  ttft=1.4s  end=length  hit=82.5%  pcie=0.0%  ssd=0.8%
+[server] s1 done  pp=55/0c 1.2s  tg=512 75.4t/s acc=72% dl=2.1  ttft=1.3s  end=length  hit=84.0%  pcie=0.0%  ssd=0.7%
+[server] s1 done  pp=56/0c 1.2s  tg=512 88.9t/s acc=85% dl=2.2  ttft=1.2s  end=length  hit=86.1%  pcie=0.0%  ssd=0.8%
+[server] s1 done  pp=7555/0c 5.9s 1283t/s  tg=512 68.2t/s acc=83% dl=2.1  ttft=5.9s  end=length  hit=80.8%  pcie=0.0%  ssd=0.9%
+[server] s1 done  pp=30104/0c 12.9s 2331t/s  tg=512 83.7t/s acc=77% dl=2.0  ttft=12.9s  end=length  hit=85.8%  pcie=0.0%  ssd=0.3%
+[server] s1 done  pp=57/0c 1.2s  tg=512 81.4t/s acc=68% dl=2.0  ttft=1.2s  end=length  hit=88.1%  pcie=0.0%  ssd=0.4%
+[server] s1 done  pp=59/0c 1.3s  tg=512 83.3t/s acc=72% dl=2.0  ttft=1.3s  end=length  hit=85.9%  pcie=0.0%  ssd=0.7%
+[server] s1 done  pp=55/0c 1.2s  tg=512 91.2t/s acc=72% dl=2.0  ttft=1.3s  end=length  hit=88.1%  pcie=0.0%  ssd=0.5%
+[server] s1 done  pp=69/0c 1.3s  tg=512 91.5t/s acc=83% dl=2.0  ttft=1.3s  end=length  hit=86.2%  pcie=0.0%  ssd=0.6%
+[server] s1 done  pp=55/0c 1.1s  tg=512 74.6t/s acc=71% dl=2.0  ttft=1.2s  end=length  hit=85.1%  pcie=0.0%  ssd=0.8%
+[server] s1 done  pp=56/0c 1.2s  tg=512 92.1t/s acc=79% dl=2.0  ttft=1.3s  end=length  hit=87.0%  pcie=0.0%  ssd=0.7%
+[server] s1 done  pp=7555/0c 6.2s 1217t/s  tg=512 76.3t/s acc=68% dl=2.0  ttft=6.2s  end=length  hit=86.0%  pcie=0.0%  ssd=0.9%
+[server] s1 done  pp=30104/0c 12.8s 2358t/s  tg=512 82.8t/s acc=61% dl=2.0  ttft=12.8s  end=length  hit=85.7%  pcie=0.0%  ssd=0.4%
