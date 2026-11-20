@@ -14,16 +14,18 @@ PRO. Engine: Maya v1.1.66, model DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL, `llm-serve
 | Gen, warm median | 49.1 t/s | **60.1 t/s (+22%)** |
 | Gen, cold | 54.0 t/s | 60.6 t/s |
 | Gen after 7.6k / 23k-token prompt | 46.1 / 52.6 t/s | 52.7 / 62.0 t/s |
-| 7.6k / 23k-token prompt | 1,910 / 3,183 t/s | 1,741 / 3,128 t/s |
+| 7.6k / 23k-token prompt (new tokens only) | 1,910 / 3,183 t/s | 1,741 / 3,128 t/s |
 | Short-prompt prefill, warm median | 47.2 t/s | 34.9 t/s |
-| Disk reads, average (peak) | 1.28 GB/s (4.9) | 1.85 GB/s (5.4) |
-| iowait, average | 5.0% | 7.4% |
-| Drafts kept | - | ~76-84% |
+| Disk reads, average (peak) | 1.39 GB/s (5.2) | 2.02 GB/s (5.7) |
+| iowait, average | 5.2% | 7.7% |
+| Drafts kept (Maya's log, not in the raw files) | - | ~76-84% |
 
 How it was measured:
 - `bin/llm-bench --max-tokens 512 --long-words 5500 22000`, run twice per config. The first pass warmed the page cache
   and was discarded.
-- `vmstat 5` ran during the measured pass. Raw JSON and the vmstat logs are in `2026-11-19/`.
+- `vmstat 5` ran during the measured pass; the averages leave out its first line, which is the average since boot.
+  Raw JSON and the vmstat logs are in `2026-11-19/`.
+- The 23k-token prompt's t/s counts only the tokens Maya read: its prefix cache reused about 7k tokens of it.
 - Before and after each pass, `/v1/models` confirmed that port 8000 was serving DeepSeek.
 - Maya was the only engine on the GPU.
 
