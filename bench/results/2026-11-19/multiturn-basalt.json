@@ -1,0 +1,86 @@
+{
+ "model": "deepseek-v4.1-flash",
+ "url": "http://127.0.0.1:8020",
+ "rows": [
+  {
+   "turn": 1,
+   "prompt_tokens": 10874,
+   "cached": 0,
+   "ttft_s": 8.69,
+   "decode_tps": 49.5,
+   "completion": 300,
+   "usage": {
+    "prompt_tokens": 10874,
+    "completion_tokens": 300,
+    "total_tokens": 11174,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   }
+  },
+  {
+   "turn": 2,
+   "prompt_tokens": 11060,
+   "cached": 10873,
+   "ttft_s": 1.23,
+   "decode_tps": 67.6,
+   "completion": 300,
+   "usage": {
+    "prompt_tokens": 11060,
+    "completion_tokens": 300,
+    "total_tokens": 11360,
+    "prompt_tokens_details": {
+     "cached_tokens": 10873
+    }
+   }
+  },
+  {
+   "turn": 3,
+   "prompt_tokens": 11076,
+   "cached": 11059,
+   "ttft_s": 0.84,
+   "decode_tps": 77.3,
+   "completion": 300,
+   "usage": {
+    "prompt_tokens": 11076,
+    "completion_tokens": 300,
+    "total_tokens": 11376,
+    "prompt_tokens_details": {
+     "cached_tokens": 11059
+    }
+   }
+  },
+  {
+   "turn": 4,
+   "prompt_tokens": 11189,
+   "cached": 11075,
+   "ttft_s": 0.8,
+   "decode_tps": 68.3,
+   "completion": 300,
+   "usage": {
+    "prompt_tokens": 11189,
+    "completion_tokens": 300,
+    "total_tokens": 11489,
+    "prompt_tokens_details": {
+     "cached_tokens": 11075
+    }
+   }
+  },
+  {
+   "turn": 5,
+   "prompt_tokens": 11212,
+   "cached": 11188,
+   "ttft_s": 0.5,
+   "decode_tps": 73.1,
+   "completion": 300,
+   "usage": {
+    "prompt_tokens": 11212,
+    "completion_tokens": 300,
+    "total_tokens": 11512,
+    "prompt_tokens_details": {
+     "cached_tokens": 11188
+    }
+   }
+  }
+ ]
+}

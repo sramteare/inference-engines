@@ -64,6 +64,25 @@ Notes:
   - `basalt-ds41-q2kxl.json`, `vmstat-basalt-ds41-q2kxl.log`, `basalt-ds41-q2kxl-serve-lines.txt`
   - `maya-dspark-rerun.json`, `vmstat-maya-dspark-rerun.log`
 
+## Multi-turn prompt reuse (`2026-11-19/multiturn.py`)
+
+A 5,578-word document and five questions; each turn resends the whole conversation (10.9k-11.6k tokens), 300 tokens
+out, temperature 0. Each engine was started cold, alone on the GPU, and answered the same turns.
+
+| Turn | Basalt: cached / first token / gen | Maya + drafter: cached / first token / gen |
+|---:|---|---|
+| 1 | 0 / 8.7 s / 49.5 t/s | 0 / 8.0 s / 39.0 t/s |
+| 2 | 10,873 / **1.2 s** / 67.6 t/s | 10,873 / 1.8 s / 52.3 t/s |
+| 3 | 11,059 / **0.8 s** / 77.3 t/s | 11,113 / 1.3 s / 56.9 t/s |
+| 4 | 11,075 / **0.8 s** / 68.3 t/s | 11,279 / 1.5 s / 53.8 t/s |
+| 5 | 11,188 / **0.5 s** / 73.1 t/s | 11,444 / 1.6 s / 41.8 t/s |
+
+- **Both engines reuse the conversation:** from turn 2 they read only the new tokens (98-99.8% cached).
+- **One run of five 11k-token turns.** Gen t/s over 300 tokens is rough. Prompts of 100k+ tokens are not covered.
+- **Build:** `~/dev/basalt-ds41-up`, the PR branch of jesdga95/basalt#481. The `llm-serve deepseek` profile runs
+  the same code plus the any-model-name serve patch, from `~/dev/basalt-ds41-serve`.
+- **Raw data:** `2026-11-19/multiturn-basalt.json`, `2026-11-19/multiturn-maya.json`.
+
 ## Not done yet
 
 - **Terminal-Bench:** 20 tasks are picked (`2026-11-19/tb-tasks.txt`). Maya's first pass is partial and some of its
@@ -71,5 +90,4 @@ Notes:
 - **Upstream:** the Basalt changes are proposed as [jesdga95/basalt#481](https://github.com/jesdga95/basalt/pull/481),
   rebased onto Basalt 0.5.0, with an independent review, parity tests and the KLD gate. The any-model-name serve patch
   was dropped: jesdga95/basalt#337 covers it.
-- **Prompt reuse across turns:** whether Basalt reuses a growing multi-turn prompt, as Maya's prefix cache does, is not
-  measured yet.
+

@@ -46,7 +46,8 @@ ln -s "$PWD"/bin/llm-* ~/.local/bin/
 
 ```bash
 llm-serve qwen              # Qwen UD-Q4_K_XL on Basalt: faster, closer to BF16 (default)
-llm-serve -d deepseek       # DeepSeek UD-Q2_K_XL on Project Maya: faithful to DeepSeek's reference, ~20x faster long prompts, background
+llm-serve -d deepseek       # DeepSeek UD-Q2_K_XL on Basalt: same quality as Maya, ~37% faster generation, reuses multi-turn prompts, background
+llm-serve deepseek-maya     # DeepSeek UD-Q2_K_XL on Project Maya: faster to the first token of a long new prompt
 llm-serve qwen-llama        # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP draft, 256k ctx (llama.cpp fallback)
 llm-serve deepseek-llama    # DeepSeek-V4.1-Flash UD-Q2_K_XL + DSpark draft, 512k ctx (llama.cpp fallback)
 llm-serve --status
@@ -55,8 +56,9 @@ DRY_RUN=1 llm-serve qwen    # print the full launch command, start nothing
 ```
 
 All profiles serve on port 8000, one at a time. `qwen` and `deepseek` run the
-models on their own engines (Basalt, Project Maya) instead of llama.cpp
-(`qwen-basalt` and `deepseek-maya` are kept as aliases of them); `llm-serve`
+models on the Basalt engine and `deepseek-maya` on Project Maya instead of
+llama.cpp (`qwen-basalt` and `deepseek-basalt` are kept as aliases of
+`qwen` and `deepseek`); `llm-serve`
 generates their config into `$LOG_DIR` (from
 `$MAYA_DIR/maya-ds4.json`, minus the refusal-direction ablation args and the
 `ablate` keys, for Maya) and `--status` / `--stop` cover them too: `--stop`
@@ -65,10 +67,16 @@ verifies each pid file still belongs to one of our servers (recorded start time
 children go with them. Environment overrides: `PORT`, `HOST`,
 `CTX`, `SPEC=0` (no speculative decoding), `MODELS`, `LLAMA_BIN`, `LOG_DIR`,
 `MAYA_DIR` (default `~/dev/maya-src`), `BASALT_DIR` (default `~/dev/basalt-src`),
-`DRY_RUN=1` (print the command — plus the generated config for the two engine
+`BASALT_DS_DIR` (default `~/dev/basalt-ds41-serve`; the Basalt build the
+`deepseek` profile runs, with the MXFP4/IQ3_S expert support
+`~/dev/basalt-src` lacks), `BASALT_DS_PYTHON` (default
+`$BASALT_DIR/.venv/bin/python`; the Python that runs the `BASALT_DS_DIR`
+server, since `BASALT_DS_DIR` has no `.venv` of its own),
+`DRY_RUN=1` (print the command — plus the generated config for the engine
 profiles — and exit; no server, no opencode sync, nothing written to `$LOG_DIR`). Extra arguments after the
 profile go to `llama-server` (or to `maya.py` / `basalt serve`).
-`HOST` defaults to `0.0.0.0`, except `qwen` and `deepseek` (Basalt and Maya),
+`HOST` defaults to `0.0.0.0`, except `qwen`, `deepseek` and `deepseek-maya`
+(the Basalt and Maya profiles),
 which bind to `127.0.0.1` unless `HOST` is set explicitly.
 
 The GPU also drives the desktop, so both profiles leave VRAM headroom:
