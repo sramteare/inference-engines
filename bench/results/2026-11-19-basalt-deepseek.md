@@ -88,6 +88,8 @@ out, temperature 0. Each engine was started cold, alone on the GPU, and answered
 harbor 0.26.0, agent `terminus-2`, `-n 1`, `--agent-timeout-multiplier 2`, one attempt per task, through
 `llm-serve -d deepseek` (Basalt) and `llm-serve -d deepseek-maya` (Maya + drafter) on :8000. Tasks:
 `2026-11-19/tb-tasks.txt`.
+Maya ran with its default 32,768-token thinking budget, Basalt with none. Only one agent step reached that size on
+each engine, both on `torch-pipeline-parallelism`.
 
 | | Maya + drafter | **Basalt + drafter** |
 |---|---|---|
@@ -125,14 +127,21 @@ phrases had already appeared.
 
 - **Basalt, the 18.4k prompt, top_p 0.95, 4 runs each way:** drafter on, 3 answered and 1 looped; drafter off
   (`spec 0`), 3 answered and 1 looped. 1 in 4 looped either way, so there is no sign the drafter causes it (4 runs
-  each is a small sample). Drafter on generated about 128 t/s against
-  72 t/s off.
-- **Maya:** one run of each prompt, both answered (0.6% and 3.9% repeats). Maya's loop rate is not measured, so this
-  does not show Basalt loops more often.
+  each is a small sample). Drafter on generated about 128 t/s against 72 t/s off.
+- **Maya, same prompt and sampling, 4 runs with its default thinking budget:** all 4 answered, but each one hit the
+  budget (32,768 tokens), where Maya closes the reasoning and makes the model answer. Maya's log says "thinking reached its
+  budget" on all 4. These runs can't show whether Maya loops.
+- **Maya, 4 runs with the budget off** (`POST /api/thinking-budget {"budget": 0}`, which matches Basalt's no-cap
+  setup): 3 answered, at 32-36k tokens, and 1 looped (93.6% repeats at word 14,811). Two of the 3 that answered went
+  through loop phases (78% and 84% repeats) and recovered.
+- **Both engines loop, 1 run in 4 each, so the loops look like the model at these settings, not one engine** (small
+  samples).
+  Maya's default thinking budget is what keeps its long reviews from running into `max_tokens`. Basalt can do the same
+  with `reasoning-budget-tokens` (a server default, 0 = none, which is our profile's setting) or a request's
+  `reasoning_budget_tokens`. Its `thinking-loop-tokens` only catches one token repeated in a row, not phrase loops.
 
 ## Not done yet
 
-- **Maya loop rate:** 4 runs of the 18.4k prompt, to compare with Basalt's 1 in 4.
 - **Upstream:** the Basalt changes are proposed as [jesdga95/basalt#481](https://github.com/jesdga95/basalt/pull/481),
   rebased onto Basalt 0.5.0, with an independent review, parity tests and the KLD gate. The any-model-name serve patch
   was dropped: jesdga95/basalt#337 covers it.
