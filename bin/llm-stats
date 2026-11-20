@@ -90,7 +90,7 @@ def metrics():
             e, l, r = eng.get("engine"), eng.get("live"), eng.get("requests")
             eng = {"engine": e if isinstance(e, dict) else {},
                    "live": l if isinstance(l, dict) else {},
-                   "requests": [x for x in r if isinstance(x, dict)] if isinstance(r, list) else []}
+                   "requests": r if isinstance(r, list) else []}
         else:
             eng = None
         return prom_metrics("/metrics/prometheus"), eng    # counters come from the Prometheus text
@@ -172,15 +172,20 @@ def is_num(v):
 
 def maya_ctx_used(lv, reqs):
     """Context in use on Maya's slot, or None. Maya's /slots has no used count, but its /metrics does: a running
-    request's prompt plus what it has generated, else the most recent finished request's prompt plus output."""
+    request's prompt plus what it has generated, else (idle) the most recent finished request's prompt plus output."""
     state = lv.get("state")
     if state in ("reading", "generating"):
-        p = lv.get("prompt_tokens")   # set the moment a request starts
+        # Maya sets prompt_tokens and generated together when a request starts; a request resuming after a fair
+        # slice re-reads with its earlier output already counted in generated
+        p, g = lv.get("prompt_tokens"), lv.get("generated")
         if not (is_num(p) and p >= 0):
             return None
-        g = lv.get("generated") if state == "generating" else 0   # while reading, generated is the last request's
         return int(p + (g if is_num(g) and g >= 0 else 0))
+    if state not in ("idle", "", None):   # unloaded: the engine and its cache are gone
+        return None
     last = reqs[0] if reqs else {}   # newest first
+    if not isinstance(last, dict):   # a bad newest row shows a dash, not an older request
+        return None
     p, o = last.get("prompt_tokens"), last.get("output_tokens")
     if is_num(p) and p >= 0 and is_num(o) and o >= 0:
         return int(p + o)

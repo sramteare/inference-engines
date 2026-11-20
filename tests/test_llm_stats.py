@@ -578,10 +578,22 @@ class LlmStatsMayaCtxTest(unittest.TestCase):
         self.assertIn("ctx    7905/524288", line)
         self.assertIn("[", line)   # the bar is drawn
 
-    def test_reading_ignores_previous_generated(self):
+    def test_reading_counts_generated_of_a_resumed_request(self):
         line = self.slot(live={"state": "reading", "phase": "reading the prompt", "prompt_tokens": 5000,
                                "generated": 6905})
+        self.assertIn("ctx   11905/524288", line)
+
+    def test_reading_fresh_request_counts_prompt(self):
+        line = self.slot(live={"state": "reading", "prompt_tokens": 5000, "generated": 0})
         self.assertIn("ctx    5000/524288", line)
+
+    def test_unloaded_shows_dash(self):
+        line = self.slot(live={"state": "unloaded"}, requests=[{"prompt_tokens": 100, "output_tokens": 5}])
+        self.assertIn("ctx       -/524288", line)
+
+    def test_bad_newest_request_does_not_fall_back(self):
+        line = self.slot(live={"state": "idle"}, requests=["bad", {"prompt_tokens": 100, "output_tokens": 5}])
+        self.assertIn("ctx       -/524288", line)
 
     def test_idle_uses_last_request(self):
         line = self.slot(live={"state": "idle"}, requests=[
