@@ -13,12 +13,21 @@ p.add_argument("--port", type=int, default=8000)
 p.add_argument("--interval", type=float, default=1.0)
 p.add_argument("--once", action="store_true")
 p.add_argument("--engine", choices=["auto", "llamacpp", "basalt", "maya"], default="auto")
-a = p.parse_args()
-BASE = f"http://{a.host}:{a.port}"
+# parse_args() must NOT run at module level: importing the module under e.g. sys.argv = ["pytest", "-q"]
+# would exit with an argparse error. main() parses and calls configure(); these are just safe defaults.
+BASE = "http://localhost:8000"
 NAMES = {"llamacpp": "llama.cpp", "basalt": "Basalt", "maya": "Maya"}
-ENGINE = None if a.engine == "auto" else a.engine  # None = not detected yet
-AUTO = a.engine == "auto"      # only auto mode may re-detect the engine after start
+ENGINE = None                  # None = not detected yet (configure() sets it for --engine X)
+AUTO = True                    # only auto mode may re-detect the engine after start
 LAST_DETECT = 0.0              # monotonic time of the last detect() in auto mode
+
+
+def configure(a):
+    """Apply parsed options to the module globals; called by main() when run as a script."""
+    global BASE, ENGINE, AUTO
+    BASE = f"http://{a.host}:{a.port}"
+    ENGINE = None if a.engine == "auto" else a.engine
+    AUTO = a.engine == "auto"
 
 
 def get(path, as_json=True, timeout=2):
@@ -90,13 +99,15 @@ def metrics():
         except Exception:
             eng = None              # tolerate absence: no live line / header extras
         if isinstance(eng, dict):   # tolerate a malformed body: keep only dict blocks
-            e, l, r = eng.get("engine"), eng.get("live"), eng.get("requests")
+            e, l, r, t = eng.get("engine"), eng.get("live"), eng.get("requests"), eng.get("totals")
             eng = {"engine": e if isinstance(e, dict) else {},
                    "live": l if isinstance(l, dict) else {},
-                   "requests": r if isinstance(r, list) else []}
+                   "requests": r if isinstance(r, list) else [],
+                   "totals": t if isinstance(t, dict) else {}}
         else:
             eng = None
-        return prom_metrics("/metrics/prometheus"), eng    # counters come from the Prometheus text
+        m = prom_metrics("/metrics/prometheus")   # running totals, the fallback when the JSON block is missing
+        return m, eng    # rates come from eng's requests, never from frame-to-frame totals
     return prom_metrics("/metrics"), None
 
 
@@ -153,14 +164,15 @@ def rate(m, tok_key, sec_key):
     return PREV.get(tok_key + "_last"), avg
 
 
-def fmt_rate(live, avg, now=None):
-    """(last, average) tok/s. now = the live in-flight rate (Maya, Basalt): shown as "now" instead of "last"."""
+def fmt_rate(live, avg, now=None, avg_label="avg"):
+    """(last, average) tok/s. now = the live in-flight rate (Maya, Basalt): shown as "now" instead of "last".
+    avg_label names the window the avg covers; Maya passes "avg(N)" so the count is honest."""
     lab = "last"
     if is_num(now):
         live, lab = now, "now"
     l = f"{live:8.1f}" if live is not None else "       -"
     v = f"{avg:8.1f}" if avg is not None else "       -"
-    return f"{lab:<4} {l} tok/s   avg {v} tok/s"
+    return f"{lab:<4} {l} tok/s   {avg_label} {v} tok/s"
 
 
 def num(v):
@@ -222,6 +234,140 @@ def maya_ctx_used(lv, reqs):
     if is_num(p) and p >= 0 and is_num(o) and o >= 0:
         return int(p + o)
     return None
+
+
+MAYA_AVG_W = len("avg(12)")   # Maya lists at most 12 requests: the widest avg label to pad to
+MAYA_LINE = 80               # Maya's rate lines and footer must fit an 80-column terminal
+
+
+def maya_avg_label(n, avg):
+    """Maya's avg label, padded to a fixed width so the Prefill and Generate columns line up whatever N is."""
+    lab = f"avg({n})" if avg is not None else "avg"
+    return lab.ljust(MAYA_AVG_W)
+
+
+def maya_count(v):
+    """Maya's token counts in at most 6 characters, so its rate lines fit 80 columns: 48987 -> "49.0k",
+    12345678 -> "12.3M". The tier is the one whose mantissa stays below 1000.0, so 999999 renders "1.0M", and
+    peta covers every count is_num() accepts (under 1e18 tokens), so the 6-character bound always holds."""
+    if not is_num(v):
+        return "-"
+    v = int(v)
+    if v < 1000:
+        return str(v)
+    for d, s in ((1000, "k"), (10 ** 6, "M"), (10 ** 9, "B"), (10 ** 12, "T"), (10 ** 15, "P")):
+        if v < 999.95 * d:
+            return f"{v / d:.1f}{s}"
+    return f"{v / 10 ** 15:.0f}P"
+
+
+def maya_live_read(read, total):
+    """Maya's live prefill suffix, always compact: ", +12.0k/40.0k live". An exact one is never offered: the
+    running counts plus "+read/total live" pass 80 columns for any real counts, so the ladder always ends up
+    compacting them; the Live line above prints the raw read and total exactly."""
+    return f", +{maya_count(read)}/{maya_count(total)} live"
+
+
+def maya_live_gen(generated):
+    """Maya's live generate suffix, exact and compact: ", +412 live" / ", +412.0k live". The exact form still
+    fits next to a small running count, so both are offered."""
+    return f", +{num(generated)} live", f", +{maya_count(generated)} live"
+
+
+def maya_counts(base, cands):
+    """Maya's count parens: the first candidate that keeps the whole line within 80 columns, as "  (…)".
+    Candidates run from most to least detail: exact counts with the word "tok", the same without it (the line
+    already says Prefill or Generate), the same counts compacted to k/M, and finally only the live progress,
+    which is what the Live line shows too. The two rate lines share the separator, so their "(" columns line up."""
+    for c in cands:
+        if c and len(base) + len(c) <= MAYA_LINE - 4:   # "  (" + ")"
+            return f"  ({c})"
+    return f"  ({[c for c in cands if c][-1]})"
+
+
+def maya_multi_call(r):
+    """True when a listed request's prompt_ms cannot rate its whole prompt: VISIBLY multi-call, or UNKNOWN.
+    Multi-call: the output covers more than the last call's engine_generated, with enough slack that two
+    roughly equal calls (output = 2 * generated) are caught too: output > 1.1 * generated + 16.
+    Unknown: engine_generated missing, None or 0 leaves nothing to compare against, and output beyond 16
+    tokens cannot belong to a last call that generated (apparently) nothing.
+    Both cases are treated alike wherever Prefill is computed: out of the avg, Prefill last shows "-".
+    Single-call rows (output close to engine_generated, or ≤ 16 tokens with no generated) stay counted;
+    a row without an output count cannot be judged either way."""
+    o, g = r.get("output_tokens"), r.get("engine_generated")
+    if not is_num(o):
+        return False
+    if not is_num(g) or g == 0:
+        return o > 16
+    return o > 1.1 * g + 16
+
+
+def maya_figures(eng, m):
+    """Maya's Prefill/Generate figures: (p_last, p_avg, p_n, g_last, g_avg, g_n, prompt, cached, output).
+
+    Maya takes reused, engine_generated, prompt_ms and decode_ms from a request's LAST engine call while its
+    prompt and output token counts cover the WHOLE request (one request can make several calls), so the mirrored
+    Prometheus totals (prompt minus reused, output over decode_ms) go negative and yield bogus rates. Rates
+    therefore come from consistent per-request sources, never from frame-to-frame differences of the totals:
+      - last  = the newest listed request's own prefill_tok_s / decode_tok_s ("-" when Maya leaves them None);
+                Generate "last" shows "-" when the newest request has no decode_tok_s (an error, a disconnect,
+                or zero output). Prefill "last" also shows "-" when the newest row is flagged by
+                maya_multi_call (multi-call or unknown): its prompt_ms covers only its last call at best, and
+                an older request's rate would contradict the footer's "last = newest request".
+      - avg   = the ratio of summed fresh-prompt and generated tokens to their ms over the listed requests whose
+                pair is consistent (0 <= reused < prompt, prompt_ms > 0 and not flagged by maya_multi_call for
+                prefill, engine_generated > 0 and decode_ms > 0 for decode); the count n labels that window.
+    Counts are Maya's running totals (only ever grow): the total prompt_tokens (NOT prompt minus reused, which a
+    multi-call request's faster-growing reused can push down), the cached reused count, and the true
+    output_tokens. They read from the JSON totals; when the JSON fetch failed for this frame (rates then show
+    "-") only the cached and output counts fall back to the Prometheus mirror, and the prompt count shows "-"
+    rather than the mirror's different quantity (prompt minus reused). A malformed negative total clamps to 0:
+    a count never renders negative."""
+    def nz(v):   # a real number, else None
+        return v if is_num(v) else None
+
+    def z0(v):   # a count that renders: a malformed negative total clamps to 0, None stays "-"
+        return None if v is None else max(0, v)
+    reqs = eng["requests"] if eng else []
+    t = eng["totals"] if eng else {}
+    newest = reqs[0] if reqs and isinstance(reqs[0], dict) else None
+    # running token counts: JSON totals first; the mirror's prompt_tokens_total is prompt minus reused, a
+    # different quantity than Maya's growing total, so the prompt count has no fallback and shows "-"
+    p = t.get("prompt_tokens")
+    prompt = z0(p if is_num(p) else None)
+    ru = t.get("reused")
+    cached = z0(ru if is_num(ru) else nz(m.get("prompt_tokens_cached_total")))
+    out = z0(t.get("output_tokens") if is_num(t.get("output_tokens")) else nz(m.get("tokens_predicted_total")))
+    if not eng:
+        return (None, None, 0, None, None, 0, prompt, cached, out)
+    # last = the newest request's own per-call rate, never an older request's: the footer says "last = newest
+    # request", so a newest row flagged by maya_multi_call (its prompt_ms covers only its last call at best)
+    # dashes Prefill last rather than falling back to the row below it
+    p_last = None
+    if newest is not None and not maya_multi_call(newest):
+        v = newest.get("prefill_tok_s")
+        p_last = v if is_num(v) and v > 0 else None
+    g_last = newest.get("decode_tok_s") if newest else None
+    g_last = g_last if is_num(g_last) and g_last > 0 else None
+    # avg = ratio of summed tokens to summed ms over the requests whose pair describes the same call
+    pf = pms = pn = 0
+    for r in reqs:
+        if not isinstance(r, dict) or maya_multi_call(r):   # a flagged row's prompt_ms is not its whole prompt
+            continue
+        rp, rr, rms = r.get("prompt_tokens"), r.get("reused"), r.get("prompt_ms")
+        rr = rr if is_num(rr) and rr >= 0 else 0   # a fresh request with no reused field reused nothing
+        if is_num(rp) and rp > rr and is_num(rms) and rms > 0:
+            pf, pms, pn = pf + (rp - rr), pms + rms, pn + 1
+    gf = gms = gn = 0
+    for r in reqs:
+        if not isinstance(r, dict):
+            continue
+        gen, dm = r.get("engine_generated"), r.get("decode_ms")
+        if is_num(gen) and gen > 0 and is_num(dm) and dm > 0:
+            gf, gms, gn = gf + gen, gms + dm, gn + 1
+    p_avg = pf / (pms / 1000) if pn > 0 else None
+    g_avg = gf / (gms / 1000) if gn > 0 else None
+    return (p_last, p_avg, pn, g_last, g_avg, gn, prompt, cached, out)
 
 
 def render():
@@ -314,6 +460,7 @@ def render():
                 lines.append(ln)
     pnow = gnow = None   # live rate overrides (Maya, Basalt): shown instead of "last" while a request runs
     psuf = gsuf = ""     # "in flight" suffixes, only ever set together with their override
+    gsuf_k = ""          # Maya: compact generate suffix, used once the exact one would pass 80 columns
     if ENGINE == "maya":   # Maya's counters only move when a request ends
         ptk = lv.get("prompt_tokens")   # the current request's prompt length, set the moment it starts
         pv = lv.get("prefill_tok_s_mean")
@@ -332,13 +479,13 @@ def render():
             else:
                 if is_num(ru) and 0 < ru < pt:   # prompt_read includes the cached prefix: count only fresh tokens
                     pr, pt = max(pr - ru, 0), max(pt - ru, 0)
-                psuf = f", +{num(pr)}/{num(pt)} in flight"
+                psuf = maya_live_read(pr, pt)
         elif state == "generating":
             ts = lv.get("tok_s")
             if is_num(ts) and ts >= 0:
                 gnow = ts if ts else 0.0   # -0.0 would render "-0.0"
                 if is_num(lv.get("generated")) and lv["generated"] >= 0:
-                    gsuf = f", +{num(lv['generated'])} in flight"
+                    gsuf, gsuf_k = maya_live_gen(lv["generated"])
     elif ENGINE == "basalt":   # Basalt's totals, like Maya's counters, only move when a request ends
         pv, ts = lv.get("prefill_tok_s_mean"), lv.get("tok_s")
         gen = gen_all if multi else row["generated"] if is_num(row.get("generated")) else lv.get("generated")
@@ -355,11 +502,28 @@ def render():
             gnow = ts if ts else 0.0   # -0.0 would render "-0.0"
             if is_num(gen) and gen >= 0:
                 gsuf = f", +{num(gen)} in flight"
-    lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"), now=pnow)
-                 + f"   ({num(m.get('prompt_tokens_total'))} tok, "
-                 f"{num(m.get('prompt_tokens_cached_total'))} cached{psuf})")
-    lines.append("Generate   " + fmt_rate(*rate(m, "tokens_predicted_total", "tokens_predicted_seconds_total"), now=gnow)
-                 + f"   ({num(m.get('tokens_predicted_total'))} tok{gsuf})")
+    if ENGINE == "maya":   # Maya's counters only move when a request ends and a request can span several calls
+        pl, pa, pn, gl, ga, gn, prompt, cached, out = maya_figures(eng, m)
+        # the count parens shorten until the line fits 80 columns, so 8-digit counts never wrap
+        pre = "Prefill    " + fmt_rate(pl, pa, now=pnow, avg_label=maya_avg_label(pn, pa))
+        gen = "Generate   " + fmt_rate(gl, ga, now=gnow, avg_label=maya_avg_label(gn, ga))
+        lines.append(pre + maya_counts(pre, [
+            f"{num(prompt)} tok, {num(cached)} cached{psuf}",
+            f"{num(prompt)}, {num(cached)} cached{psuf}",   # the line already says Prefill: "tok" can go
+            f"{maya_count(prompt)} tok, {maya_count(cached)} cached{psuf}",
+            f"{maya_count(prompt)}, {maya_count(cached)} cached{psuf}",
+            psuf.lstrip(", ")]))                           # live progress alone, as the Live line shows it
+        lines.append(gen + maya_counts(gen, [
+            f"{num(out)} tok{gsuf}",
+            f"{maya_count(out)} tok{gsuf_k}",
+            f"{maya_count(out)}{gsuf_k}",
+            gsuf_k.lstrip(", ")]))
+    else:
+        lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"), now=pnow)
+                     + f"   ({num(m.get('prompt_tokens_total'))} tok, "
+                     f"{num(m.get('prompt_tokens_cached_total'))} cached{psuf})")
+        lines.append("Generate   " + fmt_rate(*rate(m, "tokens_predicted_total", "tokens_predicted_seconds_total"), now=gnow)
+                     + f"   ({num(m.get('tokens_predicted_total'))} tok{gsuf})")
     if ENGINE == "basalt":
         off = sum(s["drafts_offered"] for s in slots if s.get("drafts_offered") is not None)
         acc = sum(s["drafts_accepted"] for s in slots if s.get("drafts_accepted") is not None)
@@ -404,18 +568,29 @@ def render():
 
     lines.append(gpu())
     lines.append("-" * 72)
-    lines.append("last = most recent request, avg = since server start. Ctrl+C to exit.")
+    # Maya's avg covers only the requests its list holds, not the server's whole uptime; the whole footer stays
+    # inside 80 columns
+    footer = ("last = newest request, avg(N) = over the N listed. Ctrl+C to exit." if ENGINE == "maya"
+              else "last = most recent request, avg = since server start. Ctrl+C to exit.")
+    lines.append(footer)
     return "\n".join(lines)
 
 
-try:
-    while True:
-        out = render()
-        if a.once:
-            print(out)
-            break
-        sys.stdout.write("\033[H\033[2J" + out + "\n")
-        sys.stdout.flush()
-        time.sleep(a.interval)
-except KeyboardInterrupt:
-    pass
+def main():
+    a = p.parse_args()
+    configure(a)
+    try:
+        while True:
+            out = render()
+            if a.once:
+                print(out)
+                break
+            sys.stdout.write("\033[H\033[2J" + out + "\n")
+            sys.stdout.flush()
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
