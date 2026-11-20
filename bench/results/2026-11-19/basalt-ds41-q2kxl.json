@@ -1,0 +1,103 @@
+[
+  {
+    "label": "basalt-ds41 run",
+    "cases": [
+      {
+        "stage": "cold",
+        "name": "cold_warm_probe",
+        "prompt_n": 57,
+        "prompt_tps": 46.8,
+        "prompt_ms": 1219.0,
+        "gen_n": 512,
+        "gen_tps": 81.4,
+        "gen_ms": 6287.0,
+        "wall_s": 7.5076982979953755,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "warm",
+        "name": "rust_spsc",
+        "prompt_n": 59,
+        "prompt_tps": 46.9,
+        "prompt_ms": 1258.7,
+        "gen_n": 512,
+        "gen_tps": 83.3,
+        "gen_ms": 6143.3,
+        "wall_s": 7.4036764149786904,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "warm",
+        "name": "sql_orderbook",
+        "prompt_n": 55,
+        "prompt_tps": 44.6,
+        "prompt_ms": 1232.3,
+        "gen_n": 512,
+        "gen_tps": 91.2,
+        "gen_ms": 5612.9,
+        "wall_s": 6.846569018001901,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "warm",
+        "name": "math_combinatorics",
+        "prompt_n": 69,
+        "prompt_tps": 52.4,
+        "prompt_ms": 1315.7,
+        "gen_n": 512,
+        "gen_tps": 91.5,
+        "gen_ms": 5592.7,
+        "wall_s": 6.909855395992054,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "warm",
+        "name": "linux_nvme",
+        "prompt_n": 55,
+        "prompt_tps": 48.3,
+        "prompt_ms": 1139.0,
+        "gen_n": 512,
+        "gen_tps": 74.6,
+        "gen_ms": 6864.3,
+        "wall_s": 8.00483184499899,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "warm",
+        "name": "python_async",
+        "prompt_n": 56,
+        "prompt_tps": 45.0,
+        "prompt_ms": 1245.0,
+        "gen_n": 512,
+        "gen_tps": 92.1,
+        "gen_ms": 5557.3,
+        "wall_s": 6.804232413007412,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "long",
+        "name": "long_5500w",
+        "prompt_n": 7555,
+        "prompt_tps": 1217.1,
+        "prompt_ms": 6207.2,
+        "gen_n": 512,
+        "gen_tps": 76.3,
+        "gen_ms": 6706.5,
+        "wall_s": 12.917749849992106,
+        "draft_acc_pct": null
+      },
+      {
+        "stage": "long",
+        "name": "long_22000w",
+        "prompt_n": 30104,
+        "prompt_tps": 2357.8,
+        "prompt_ms": 12768.0,
+        "gen_n": 512,
+        "gen_tps": 82.8,
+        "gen_ms": 6182.0,
+        "wall_s": 18.9601448700123,
+        "draft_acc_pct": null
+      }
+    ]
+  }
+]
