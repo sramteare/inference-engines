@@ -261,17 +261,36 @@ def maya_count(v):
     return f"{v / 10 ** 15:.0f}P"
 
 
+def maya_short(v):
+    """Maya's live progress counts in at most 4 characters for any count below a billion: one decimal below 10 of
+    a tier, none above it, so 1234 -> "1.2k", 12345 -> "12k", 987654321 -> "988M". The tier is the one whose
+    rounded mantissa stays below 1000, so 999999 renders "1.0M", never "1000k"."""
+    if not is_num(v):
+        return "-"
+    v = int(v)
+    if v < 1000:
+        return str(v)
+    for d, s in ((1000, "k"), (10 ** 6, "M"), (10 ** 9, "B"), (10 ** 12, "T"), (10 ** 15, "P")):
+        if v < 9.95 * d:
+            return f"{v / d:.1f}{s}"
+        if v < 999.5 * d:
+            return f"{v / d:.0f}{s}"
+    return f"{v / 10 ** 15:.0f}P"
+
+
 def maya_live_read(read, total):
-    """Maya's live prefill suffix, always compact: ", +12.0k/40.0k live". An exact one is never offered: the
-    running counts plus "+read/total live" pass 80 columns for any real counts, so the ladder always ends up
-    compacting them; the Live line above prints the raw read and total exactly."""
-    return f", +{maya_count(read)}/{maya_count(total)} live"
+    """Maya's live prefill suffix, always compact, worded like Basalt's: ", +12k/40k in flight". The counts use
+    maya_short, so "+read/total in flight" is at most 20 characters for any count below a billion and fits the
+    21 the Prefill line leaves for its parens. An exact one is never offered: the running counts plus the
+    progress pass 80 columns for any real counts; the Live line above prints the raw read and total exactly."""
+    return f", +{maya_short(read)}/{maya_short(total)} in flight"
 
 
 def maya_live_gen(generated):
-    """Maya's live generate suffix, exact and compact: ", +412 live" / ", +412.0k live". The exact form still
-    fits next to a small running count, so both are offered."""
-    return f", +{num(generated)} live", f", +{maya_count(generated)} live"
+    """Maya's live generate suffix, worded like Basalt's, exact and compact: ", +412 in flight" /
+    ", +412k in flight". The exact form still fits next to a small running count, so both are offered; the
+    compact one uses maya_short, so it still fits beside a compacted running total ("98.8M, +12M in flight")."""
+    return f", +{num(generated)} in flight", f", +{maya_short(generated)} in flight"
 
 
 def maya_counts(base, cands):

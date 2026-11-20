@@ -291,7 +291,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(len(gen), 1, out.stdout)
         self.assertIn("42 tok", gen[0])
 
-    def test_reading_prefill_shows_now_rate_and_live_suffix(self):
+    def test_reading_prefill_shows_now_rate_and_in_flight_suffix(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 12000,
                 "prompt_total": 40000, "prompt_tokens": 40000}
         out = run_stats(self.serve(live=live))
@@ -299,19 +299,19 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
         self.assertIn("1234.5", pre)
-        self.assertIn("+12.0k/40.0k live", pre)   # compact: the exact pair would not fit the line
+        self.assertIn("+12k/40k in flight", pre)   # compact: the exact pair would not fit the line
         gen = rate_line(out.stdout, "Generate")
         self.assertTrue(gen.startswith("Generate   last "), gen)   # first column stays "last"
         self.assertNotIn("now", gen)
 
-    def test_reading_live_suffix_counts_only_fresh_tokens(self):
+    def test_reading_in_flight_suffix_counts_only_fresh_tokens(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 100000,
                 "prompt_read": 100500, "prompt_total": 102000, "prompt_tokens": 102000}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
-        self.assertIn("+500/2.0k live", pre)   # 500 fresh of 2000 (102000 - 100000 reused), not of 102000
+        self.assertIn("+500/2.0k in flight", pre)   # 500 fresh of 2000 (102000 - 100000 reused), not of 102000
 
     def test_reading_stale_prompt_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -325,7 +325,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             line = rate_line(out.stdout, "Prefill")
             self.assertEqual(line, base)   # byte-identical to the idle run
             self.assertIn("last ", line)
-            self.assertNotIn("live", line)
+            self.assertNotIn("in flight", line)
 
     def test_reading_bad_prefill_rate_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -338,7 +338,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             self.assertEqual(out.returncode, 0, f"raw={raw}\n{out.stdout}\n{out.stderr}")
             line = rate_line(out.stdout, "Prefill")
             self.assertEqual(line, base)
-            self.assertNotIn("live", line)
+            self.assertNotIn("in flight", line)
 
     def test_reading_missing_prompt_read_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -350,26 +350,26 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertEqual(pre, base)
         self.assertNotIn("now", pre)
-        self.assertNotIn("live", pre)
+        self.assertNotIn("in flight", pre)
 
-    def test_generating_generate_shows_now_rate_and_live_suffix(self):
+    def test_generating_generate_shows_now_rate_and_in_flight_suffix(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": 412}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("31.2", gen)
-        self.assertIn("+412 live", gen)
+        self.assertIn("+412 in flight", gen)
         pre = rate_line(out.stdout, "Prefill")
         self.assertTrue(pre.startswith("Prefill    last "), pre)
-        self.assertNotIn("live", pre)
+        self.assertNotIn("in flight", pre)
 
     def test_generating_generate_line_exact_format(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": 412}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(rate_line(out.stdout, "Generate"),
-                         "Generate   now      31.2 tok/s   avg            - tok/s  (- tok, +412 live)")
+                         "Generate   now      31.2 tok/s   avg            - tok/s  (- tok, +412 in flight)")
 
     def test_generating_prefill_line_stays_idle_form(self):
         # no generating-phase Prefill "now": the line is the plain last/avg idle form
@@ -384,16 +384,16 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(pre, base)
         self.assertIn("last ", pre)
         self.assertNotIn("now", pre)
-        self.assertNotIn("live", pre)
+        self.assertNotIn("in flight", pre)
 
-    def test_generating_missing_generated_shows_now_without_live_suffix(self):
+    def test_generating_missing_generated_shows_now_without_in_flight_suffix(self):
         live = {"state": "generating", "tok_s": 31.2}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("31.2", gen)
-        self.assertNotIn("live", gen)
+        self.assertNotIn("in flight", gen)
 
     def test_idle_prefill_generate_use_last(self):
         out = run_stats(self.serve(live={"state": "idle"}))
@@ -401,7 +401,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         for prefix in ("Prefill", "Generate"):
             line = rate_line(out.stdout, prefix)
             self.assertNotIn("now", line)
-            self.assertNotIn("live", line)
+            self.assertNotIn("in flight", line)
 
     def test_unloaded_prefill_generate_use_last(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -421,7 +421,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             line = rate_line(out.stdout, "Generate")
             self.assertEqual(line, base)   # byte-identical to the idle run: port never appears here
             self.assertIn("last ", line)
-            self.assertNotIn("live", line)
+            self.assertNotIn("in flight", line)
 
     def test_reading_finished_prompt_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -435,7 +435,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             pre = rate_line(out.stdout, "Prefill")
             self.assertEqual(pre, base)   # stale: the read can no longer grow
             self.assertNotIn("now", pre)
-            self.assertNotIn("live", pre)
+            self.assertNotIn("in flight", pre)
 
     def test_reading_non_positive_prefill_rate_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -449,7 +449,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             pre = rate_line(out.stdout, "Prefill")
             self.assertEqual(pre, base)
             self.assertNotIn("now", pre)
-            self.assertNotIn("live", pre)
+            self.assertNotIn("in flight", pre)
 
     def test_reading_prompt_read_past_total_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -462,7 +462,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertEqual(pre, base)
         self.assertNotIn("now", pre)
-        self.assertNotIn("live", pre)
+        self.assertNotIn("in flight", pre)
 
     def test_reading_negative_reused_does_not_subtract(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": -1,
@@ -471,7 +471,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
-        self.assertIn("+100/200 live", pre)
+        self.assertIn("+100/200 in flight", pre)
 
     def test_reading_negative_prompt_read_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -484,9 +484,9 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertEqual(pre, base)   # negative prompt_read: no live prefill at all
         self.assertNotIn("now", pre)
-        self.assertNotIn("live", pre)
+        self.assertNotIn("in flight", pre)
 
-    def test_reading_reused_covering_the_prompt_shows_now_without_live_suffix(self):
+    def test_reading_reused_covering_the_prompt_shows_now_without_in_flight_suffix(self):
         for ru, read, total in [(40000, 20000, 40000),    # reused == total
                                 (200000, 100500, 102000)]:   # reused past total
             live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": ru,
@@ -496,7 +496,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             pre = rate_line(out.stdout, "Prefill")
             self.assertIn("now ", pre)
             self.assertIn("1234.5", pre)
-            self.assertNotIn("live", pre)   # nothing fresh left to count
+            self.assertNotIn("in flight", pre)   # nothing fresh left to count
 
     def test_reading_reused_above_read_clamps_fresh_read_to_zero(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 150,
@@ -505,7 +505,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
-        self.assertIn("+0/50 live", pre)
+        self.assertIn("+0/50 in flight", pre)
 
     def test_generating_negative_tok_s_falls_back_to_idle_generate_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -517,7 +517,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         gen = rate_line(out.stdout, "Generate")
         self.assertEqual(gen, base)
         self.assertIn("last ", gen)
-        self.assertNotIn("live", gen)
+        self.assertNotIn("in flight", gen)
 
     def test_generating_zero_tok_s_shows_now(self):
         live = {"state": "generating", "tok_s": 0.0, "generated": 3}
@@ -526,7 +526,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("0.0 tok/s", gen)
-        self.assertIn("+3 live", gen)
+        self.assertIn("+3 in flight", gen)
 
     def test_generating_negative_zero_tok_s_shows_zero(self):
         body = '{"live": {"state": "generating", "tok_s": -0.0, "generated": 3}}'   # raw text: -0.0 survives parsing
@@ -537,14 +537,14 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("0.0 tok/s", gen)
         self.assertNotIn("-0.0", gen)
 
-    def test_generating_negative_generated_shows_now_without_live_suffix(self):
+    def test_generating_negative_generated_shows_now_without_in_flight_suffix(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": -1}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("31.2", gen)
-        self.assertNotIn("live", gen)
+        self.assertNotIn("in flight", gen)
 
     def test_resumed_maya_totals_show_no_negative_and_pairs_drive_generate(self):
         # the saved bug moment: reused > prompt in totals (a resumed request's reused holds the earlier output
@@ -937,7 +937,7 @@ class LlmStatsMayaTest(unittest.TestCase):
     def test_maya_rate_lines_and_footer_fit_80_columns(self):
         # 8-digit running totals, with and without a live request: Prefill, Generate and the footer all stay
         # within 80 columns. The counts compact to k/M ("12.3M, 87.7M cached") and a live request's progress
-        # alone is shown when the totals would not fit beside it ("+12.3M/87.7M live").
+        # alone is shown when the totals would not fit beside it ("+12M/88M in flight").
         server = self._maya_server()
         reqs = [self._req(k) for k in range(3)]
         big = {"prompt_tokens": 12345678, "reused": 87654321, "output_tokens": 98765432}
@@ -947,9 +947,9 @@ class LlmStatsMayaTest(unittest.TestCase):
             ({"state": "idle"}, "(12.3M, 87.7M cached)", "(98765432 tok)"),   # exact counts still fit Generate
             ({"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 10, "prompt_read": 12345678,
               "prompt_total": 87654321, "prompt_tokens": 87654321},           # 8-digit read of an 8-digit prompt
-             "(+12.3M/87.7M live)", "(98765432 tok)"),
+             "(+12M/88M in flight)", "(98765432 tok)"),
             ({"state": "generating", "tok_s": 31.2, "generated": 12345678},
-             "(12.3M, 87.7M cached)", "(98.8M, +12.3M live)"),
+             "(12.3M, 87.7M cached)", "(98.8M, +12M in flight)"),
         ]
         for live, want_pre, want_gen in cases:
             server.metrics_body = {"engine": ENGINE, "live": live, "requests": reqs, "totals": big}
@@ -978,6 +978,28 @@ class LlmStatsMayaTest(unittest.TestCase):
                              (0, 999, 1000, 48987, 999949, 999999, 12345678, 987654321,
                               10 ** 12, 10 ** 15, 10 ** 18 - 1)), 6)
         self.assertEqual(mod.maya_count(999999), "1.0M")   # never "1000.0k"
+        # the widest live prefill: 9-digit read and total still fit, with "(" aligned with Generate's
+        live = {"state": "reading", "prefill_tok_s_mean": 99999.9, "prompt_reused": 0, "prompt_read": 999999997,
+                "prompt_total": 999999999, "prompt_tokens": 999999999}
+        server.metrics_body = {"engine": ENGINE, "live": live, "requests": reqs, "totals": big}
+        frame = mod.render()
+        pre, gen = rate_line(frame, "Prefill"), rate_line(frame, "Generate")
+        self.assertIn("(+1.0B/1.0B in flight)", pre)
+        self.assertLessEqual(len(pre), 80, pre)
+        self.assertEqual(pre.rindex("("), gen.rindex("("), f"{pre}\n{gen}")
+        live = {**live, "prompt_read": 998999999, "prompt_total": 999499999, "prompt_tokens": 999499999}
+        server.metrics_body = {"engine": ENGINE, "live": live, "requests": reqs, "totals": big}
+        frame = mod.render()
+        pre, gen = rate_line(frame, "Prefill"), rate_line(frame, "Generate")
+        self.assertIn("(+999M/999M in flight)", pre)   # the widest count pair below a billion
+        self.assertLessEqual(len(pre), 80, pre)
+        self.assertEqual(pre.rindex("("), gen.rindex("("), f"{pre}\n{gen}")
+        # maya_short stays within 4 characters for every count below a billion
+        self.assertEqual(max(len(mod.maya_short(v)) for v in
+                             (0, 999, 1000, 9949, 9950, 99999, 999499, 999500, 999999, 9949999, 999499999,
+                              999500000, 999999999)), 4)
+        self.assertEqual(mod.maya_short(999999), "1.0M")   # never "1000k"
+        self.assertEqual(mod.maya_short(12345), "12k")
 
 
 BASALT_ENGINE = {"version": "0.4.1", "quant": "Q4_K_XL", "kv": "fp16"}
