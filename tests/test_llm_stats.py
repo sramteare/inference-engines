@@ -101,7 +101,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("Maya", out.stdout)
         self.assertIn("DeepSeek V4.1", out.stdout)
         line = live_line(out.stdout)
-        for want in ["thinking", "generated 6905/32000 tok", "70.8 tok/s now", "mean 52.2", "elapsed 136.1 s"]:
+        for want in ["thinking", "generated 6905/32000 tok", "70.8 tok/s", "(mean  52.2)", "elapsed  136.1 s"]:
             self.assertIn(want, line)
 
     def test_reading_shows_prompt_not_generated(self):
@@ -120,7 +120,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         line = live_line(out.stdout)
         self.assertIn("generated 120/500 tok", line)
-        self.assertNotIn("tok/s now", line)
+        self.assertNotIn("tok/s", line)
 
     def test_reading_prompt_wins_over_generated(self):
         live = {"state": "reading", "prompt_read": 10, "prompt_total": 20, "generated": 5}
@@ -152,10 +152,25 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("Maya", out.stdout)
         self.assertNotIn("Live", out.stdout)
 
-    def test_empty_phase_has_no_blank_segment(self):
+    def test_empty_phase_keeps_columns(self):
         out = run_stats(self.serve(live={"state": "generating", "phase": "", "generated": 5}))
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(live_line(out.stdout), "Live       generated 5 tok")
+        self.assertEqual(live_line(out.stdout), "Live       " + " " * (10 + 2 + 12 + 2 + 12 + 2 + 16 + 2) + "generated 5 tok")
+
+    def test_live_columns_do_not_move(self):
+        lives = [{"state": "generating", "phase": "thinking", "generated": 5, "max_tokens": 32000,
+                  "elapsed_s": 1.0, "tok_s": 9.5, "tok_s_mean": 8.0},
+                 {"state": "generating", "phase": "writing", "generated": 123456, "max_tokens": 0,
+                  "elapsed_s": 9999.9, "tok_s": 1234.5, "tok_s_mean": 999.9},
+                 {"state": "generating", "phase": "thinking", "generated": 7, "elapsed_s": 3.0,
+                  "tok_s": None, "tok_s_mean": None}]
+        cols = set()
+        for live in lives:
+            out = run_stats(self.serve(live=live))
+            self.assertEqual(out.returncode, 0, out.stderr)
+            line = live_line(out.stdout)
+            cols.add((line.index("elapsed"), line.index("generated")))
+        self.assertEqual(len(cols), 1, cols)
 
     def test_huge_int_generated_never_renders(self):
         body = '{"live": {"state": "generating", "phase": "thinking", "generated": %s}}' % ("9" * 400)
@@ -500,6 +515,23 @@ class BasaltHandler(StubHandler):
         self.respond(routes)
 
 
+class BasaltLiveServer(HTTPServer):
+    live = {}
+    slots = [{"id": 0, "n_ctx": 524288, "is_processing": True, "ctx_used": 1000, "tok_s": 0.0}]
+
+
+class BasaltLiveHandler(StubHandler):
+    def do_GET(self):
+        self.respond({
+            "/health": {"service": "basalt", "status": "ok"},
+            "/v1/models": {"data": [{"id": "basalt-test", "meta": {"n_ctx": 524288}}]},
+            "/metrics": {"engine": BASALT_ENGINE, "live": self.server.live,
+                         "totals": {"requests": 0, "prompt": 0, "reused": 0, "written": 0,
+                                    "prompt_ms": 0.0, "decode_ms": 0.0}},
+            "/slots": self.server.slots,
+        })
+
+
 class LlamaCppHandler(StubHandler):
     def do_GET(self):
         routes = {
@@ -558,6 +590,111 @@ class LlmStatsHeaderTest(unittest.TestCase):
         out = self.assert_header_unchanged(LlamaCppHandler, self.GOLDEN["llamacpp"])
         for prefix, golden in self.GOLDEN_RATES["llamacpp"].items():
             self.assertEqual(rate_line(out.stdout, prefix), golden)
+
+
+class LlmStatsBasaltLiveTest(unittest.TestCase):
+    """Basalt's live block: a Live line and "now" rates while its first request still runs (totals still 0).
+    Field shapes follow Basalt's serve/service.py: phase "reading the prompt" while reading, a slot's `reused`
+    stays None until the first token, and `prefill_done` counts the cached prefix as read."""
+    GEN = {"state": "generating", "phase": "thinking", "prompt_tokens": 23499, "generated": 10403,
+           "elapsed_s": 129.9, "tok_s": 104.7, "prefill_tok_s_mean": 1797.9, "slots": {"active": 1}, "queued": 0}
+    READ = {"state": "reading", "phase": "reading the prompt", "prompt_tokens": 23499, "generated": 0,
+            "elapsed_s": 4.2, "tok_s": None, "prefill_tok_s_mean": 1800.5, "slots": {"active": 1}, "queued": 0}
+    GEN_ROW = {"id": 0, "n_ctx": 524288, "is_processing": True, "state": "decoding", "max_tokens": 64000,
+               "generated": 10403, "prompt_tokens": 23499, "prefill_done": 23499, "reused": 0}
+    READ_ROW = {"id": 0, "n_ctx": 524288, "is_processing": True, "state": "prefill", "generated": 0,
+                "prompt_tokens": 23499, "prefill_done": 8192, "reused": None}
+
+    def run_live(self, live, slots=None):
+        server = BasaltLiveServer(("127.0.0.1", 0), BasaltLiveHandler)
+        server.live = live
+        if slots is not None:
+            server.slots = slots
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        out = run_stats(server.server_address[1])
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return out.stdout
+
+    def test_generating_live_line_and_now_rate(self):
+        out = self.run_live(self.GEN, [self.GEN_ROW])
+        self.assertEqual(live_line(out), "Live       thinking     104.7 tok/s  elapsed  129.9 s"
+                                         "  generated 10403/64000 tok")
+        self.assertEqual(rate_line(out, "Generate"),
+                         "Generate   now     104.7 tok/s   avg        - tok/s   (0 tok, +10403 in flight)")
+        self.assertTrue(rate_line(out, "Prefill").startswith("Prefill    last        - tok/s"))
+
+    def test_reading_live_line_shortens_phase(self):
+        line = live_line(self.run_live(self.READ, [self.READ_ROW]))   # "reading the prompt" -> "reading"
+        self.assertEqual(line, "Live       reading" + " " * 17 + "  elapsed    4.2 s  prompt 8192/23499 tok")
+
+    def test_long_phases_get_short_ascii_labels_and_columns_hold(self):
+        gen = live_line(self.run_live(self.GEN, [self.GEN_ROW]))
+        for phase, want in [("writing a tool call: search_files", "tool call"), ("tool call complete", "tool done"),
+                            ("summarizing context", "summarizi~")]:
+            line = live_line(self.run_live({**self.GEN, "phase": phase}, [self.GEN_ROW]))
+            self.assertTrue(line.startswith(f"Live       {want:<10}  "), line)
+            self.assertEqual(gen.index("elapsed"), line.index("elapsed"))
+            line.encode("ascii")   # a non-ASCII cut mark would crash a non-UTF-8 terminal
+        self.assertLessEqual(len(gen), 80)
+
+    def test_newest_request_without_a_slot_does_not_label_the_running_one(self):
+        # parallel: the live block is a newer request still waiting for a slot, while slot 0 runs another one
+        live = {**self.GEN, "phase": "reading the prompt", "prompt_tokens": 500, "generated": 0, "elapsed_s": 0.3}
+        out = self.run_live(live, [self.GEN_ROW])
+        line = live_line(out)
+        self.assertTrue(line.endswith("generated 10403/64000 tok"), line)
+        self.assertNotIn("reading", line)
+        self.assertNotIn("elapsed", line)
+        self.assertIn("+10403 in flight", rate_line(out, "Generate"))
+
+    def test_reading_prefill_counts_cache_until_basalt_reports_it(self):
+        out = self.run_live(self.READ, [self.READ_ROW])   # reused None: prefill_done includes the cached prefix
+        self.assertEqual(rate_line(out, "Prefill"), "Prefill    now    1800.5 tok/s   avg        - tok/s"
+                                                    "   (0 tok, 0 cached, 8192/23499 read incl. cached)")
+        self.assertTrue(rate_line(out, "Generate").startswith("Generate   last        - tok/s"))
+
+    def test_reading_known_reuse_counts_only_fresh_tokens(self):
+        out = self.run_live(self.READ, [{**self.READ_ROW, "prefill_done": 9000, "reused": 8000}])
+        self.assertIn("+1000/15499 in flight", rate_line(out, "Prefill"))
+
+    def test_reading_before_progress_hides_stale_rate(self):
+        for done in (None, 0):   # the batched engine still holds the previous request's prefill rate
+            out = self.run_live(self.READ, [{**self.READ_ROW, "prefill_done": done}])
+            self.assertTrue(rate_line(out, "Prefill").startswith("Prefill    last "), (done, out))
+            self.assertTrue(live_line(out).endswith("prompt 23499 tok" if done is None else "prompt 0/23499 tok"), out)
+
+    def test_several_busy_slots_show_only_totals(self):
+        live = {**self.GEN, "tok_s": 210.0, "generated": 0, "phase": "reading the prompt", "elapsed_s": 0.5}
+        rows = [{**self.GEN_ROW, "generated": 5000}, {**self.READ_ROW, "id": 1, "generated": 0},
+                {"id": 2, "is_processing": False}]
+        out = self.run_live(live, rows)
+        line = live_line(out)
+        self.assertTrue(line.endswith("2 requests, generated 5000 tok"), line)
+        self.assertNotIn("reading", line)
+        self.assertNotIn("elapsed", line)
+        self.assertIn("210.0 tok/s", line)
+        self.assertEqual(rate_line(out, "Generate"),
+                         "Generate   now     210.0 tok/s   avg        - tok/s   (0 tok, +5000 in flight)")
+        self.assertTrue(rate_line(out, "Prefill").startswith("Prefill    last "))
+
+    def test_one_busy_of_several_slots_uses_its_row(self):
+        out = self.run_live(self.GEN, [{"id": 0, "is_processing": False}, {**self.GEN_ROW, "id": 1}])
+        self.assertTrue(live_line(out).endswith("generated 10403/64000 tok"))
+
+    def test_bad_values_fall_back(self):
+        for live in [{**self.GEN, "tok_s": "fast", "generated": True, "elapsed_s": None},
+                     {**self.GEN, "tok_s": -1.0}, {**self.READ, "prefill_tok_s_mean": 0}, "broken", []]:
+            out = self.run_live(live, [self.READ_ROW])
+            self.assertTrue(rate_line(out, "Prefill").startswith("Prefill    last "), (live, out))
+            self.assertTrue(rate_line(out, "Generate").startswith("Generate   last "), (live, out))
+            self.assertNotIn("in flight", out)
+
+    def test_idle_has_no_live_line(self):
+        out = self.run_live({"state": "idle", "tok_s": None})
+        self.assertNotIn("Live", out)
+        self.assertTrue(rate_line(out, "Generate").startswith("Generate   last "))
 
 
 def slot_line(stdout):
