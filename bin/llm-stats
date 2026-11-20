@@ -57,8 +57,11 @@ def prom_metrics(path):
 def basalt_metrics():
     """Basalt's JSON /metrics mapped onto the llama.cpp counter names."""
     j = get("/metrics")
-    t, live = j.get("totals") or {}, j.get("live") or {}
-    slots = live.get("slots") or {}
+    j = j if isinstance(j, dict) else {}   # tolerate a malformed body: keep only dict blocks
+    t, live = j.get("totals"), j.get("live")
+    t, live = t if isinstance(t, dict) else {}, live if isinstance(live, dict) else {}
+    slots = live.get("slots")
+    slots = slots if isinstance(slots, dict) else {}
     m, prompt, reused = {}, t.get("prompt"), t.get("reused")
     if prompt is not None:
         m["prompt_tokens_total"] = prompt - (reused or 0)
@@ -151,7 +154,7 @@ def rate(m, tok_key, sec_key):
 
 
 def fmt_rate(live, avg, now=None):
-    """(last, average) tok/s. now = Maya's live in-flight rate: shown as "now" instead of "last"."""
+    """(last, average) tok/s. now = the live in-flight rate (Maya, Basalt): shown as "now" instead of "last"."""
     lab = "last"
     if is_num(now):
         live, lab = now, "now"
@@ -168,6 +171,35 @@ def is_num(v):
     # finite int/float only: no bool, NaN or Infinity (JSON 1e309) reaching num() or ":.1f";
     # abs(v) < 1e18 first so isfinite never sees a huge int (OverflowError on a 400-digit JSON number)
     return isinstance(v, (int, float)) and not isinstance(v, bool) and abs(v) < 1e18 and math.isfinite(v)
+
+
+def short_phase(p):
+    """A phase in at most 10 ASCII characters: Basalt's long phase names get short labels, anything else is cut."""
+    if not isinstance(p, str):
+        return ""
+    p = "tool call" if p.startswith("writing a tool call") else \
+        {"reading the prompt": "reading", "tool call complete": "tool done"}.get(p, p)
+    return p if len(p) <= 10 else p[:9] + "~"
+
+
+def live_line(phase, ts, el, progress, mean=None, show_mean=False):
+    """The Live line as fixed-width columns (phase, rate, [mean], elapsed), then the variable-length progress last,
+    so a refresh never moves a column, in 80 columns for a typical Basalt line. None when there is nothing to show."""
+    phase = short_phase(phase)
+    if not (phase or is_num(ts) or (show_mean and is_num(mean)) or is_num(el) or progress):
+        return None
+    cols = [f"{phase:<10}", f"{ts:6.1f} tok/s" if is_num(ts) else " " * 12]
+    if show_mean:
+        cols.append(f"(mean {mean:5.1f})" if is_num(mean) else " " * 12)
+    cols += [f"elapsed {el:6.1f} s" if is_num(el) else " " * 16, progress]
+    return ("Live       " + "  ".join(cols)).rstrip()
+
+
+def gen_progress(gen, mx):
+    """"generated N[/max] tok", or "" when N is unknown; max 0/-1 = rest of the context, no slash."""
+    if not is_num(gen):
+        return ""
+    return f"generated {num(gen)}" + (f"/{num(mx)}" if is_num(mx) and mx > 0 else "") + " tok"
 
 
 def maya_ctx_used(lv, reqs):
@@ -235,30 +267,52 @@ def render():
     lines.append("-" * 72)
     lines.append(f"Load       processing: {num(m.get('requests_processing'))}   "
                  f"queued: {num(m.get('requests_deferred'))}")
-    lv, state = {}, None   # Maya live block, so the prefill/generate block below never depends on the one above
+    lv, state = {}, None   # Maya/Basalt live block, so the prefill/generate block below never depends on the one above
     if ENGINE == "maya":
         lv = (eng or {}).get("live") or {}
         state = lv.get("state")
         if isinstance(state, str) and state and state != "idle":   # live progress while generating; "" = no request
-            parts = [lv["phase"]] if isinstance(lv.get("phase"), str) and lv["phase"] else []
             pr, pt = lv.get("prompt_read"), lv.get("prompt_total")
             if state == "reading" and is_num(pr) and is_num(pt):
-                parts.append(f"prompt {num(pr)}/{num(pt)} tok")   # Maya sets these only while reading
-            elif is_num(lv.get("generated")):
-                g = f"generated {num(lv['generated'])}"
-                if is_num(lv.get("max_tokens")) and lv["max_tokens"] > 0:   # 0/-1 = rest of the context
-                    g += f"/{num(lv['max_tokens'])}"
-                parts.append(g + " tok")
-            if is_num(lv.get("tok_s")):
-                r = f"{lv['tok_s']:.1f} tok/s now"
-                if is_num(lv.get("tok_s_mean")):
-                    r += f" (mean {lv['tok_s_mean']:.1f})"
-                parts.append(r)
-            if is_num(lv.get("elapsed_s")):
-                parts.append(f"elapsed {lv['elapsed_s']:.1f} s")
-            if parts:
-                lines.append("Live       " + "  ".join(parts))
-    pnow = gnow = None   # Maya live rate overrides: shown instead of "last" while a request runs
+                prog = f"prompt {num(pr)}/{num(pt)} tok"   # Maya sets these only while reading
+            else:
+                prog = gen_progress(lv.get("generated"), lv.get("max_tokens"))
+            ts = lv.get("tok_s")
+            ln = live_line(lv.get("phase"), ts, lv.get("elapsed_s"), prog,
+                           mean=lv.get("tok_s_mean") if is_num(ts) else None, show_mean=True)
+            if ln:
+                lines.append(ln)
+    elif ENGINE == "basalt":
+        lv = (eng or {}).get("live")
+        lv = lv if isinstance(lv, dict) else {}
+        state = lv.get("state")
+        busy = [r for r in slots if isinstance(r, dict) and r.get("is_processing")] if isinstance(slots, list) else []
+        row = busy[0] if len(busy) == 1 else {}   # the one running request's slot row; {} when several or none
+        multi = len(busy) > 1   # live's tok_s sums every request, its phase/generated/elapsed are the newest one's only
+        gen_all = sum(r["generated"] for r in busy if is_num(r.get("generated")))
+        if state in ("reading", "generating") and multi:
+            ln = live_line(None, lv.get("tok_s") if state == "generating" else None, None,
+                           f"{len(busy)} requests, generated {num(gen_all)} tok")
+            if ln:
+                lines.append(ln)
+        elif state in ("reading", "generating"):
+            # with parallel requests the live block is the newest request's, which may still wait for a slot
+            # while another one runs: then its phase and elapsed time are not this slot's
+            own = not (is_num(row.get("prompt_tokens")) and lv.get("prompt_tokens") != row["prompt_tokens"])
+            if state == "reading":
+                done, tot = row.get("prefill_done"), row.get("prompt_tokens")
+                if is_num(done) and is_num(tot):
+                    prog = f"prompt {num(done)}/{num(tot)} tok"
+                else:
+                    prog = f"prompt {num(lv['prompt_tokens'])} tok" if is_num(lv.get("prompt_tokens")) else ""
+            else:
+                prog = gen_progress(row["generated"] if is_num(row.get("generated")) else lv.get("generated"),
+                                    row.get("max_tokens"))
+            ln = live_line(lv.get("phase") if own else None, lv.get("tok_s") if state == "generating" else None,
+                           lv.get("elapsed_s") if own else None, prog)
+            if ln:
+                lines.append(ln)
+    pnow = gnow = None   # live rate overrides (Maya, Basalt): shown instead of "last" while a request runs
     psuf = gsuf = ""     # "in flight" suffixes, only ever set together with their override
     if ENGINE == "maya":   # Maya's counters only move when a request ends
         ptk = lv.get("prompt_tokens")   # the current request's prompt length, set the moment it starts
@@ -285,6 +339,22 @@ def render():
                 gnow = ts if ts else 0.0   # -0.0 would render "-0.0"
                 if is_num(lv.get("generated")) and lv["generated"] >= 0:
                     gsuf = f", +{num(lv['generated'])} in flight"
+    elif ENGINE == "basalt":   # Basalt's totals, like Maya's counters, only move when a request ends
+        pv, ts = lv.get("prefill_tok_s_mean"), lv.get("tok_s")
+        gen = gen_all if multi else row["generated"] if is_num(row.get("generated")) else lv.get("generated")
+        pr, pt, ru = row.get("prefill_done"), row.get("prompt_tokens"), row.get("reused")
+        # the batched engine keeps the previous request's prefill rate until this read reports progress,
+        # so require the slot's own progress first; with several requests the rate has no single owner
+        if state == "reading" and is_num(pv) and pv > 0 and is_num(pr) and is_num(pt) and 0 < pr <= pt:
+            pnow = pv
+            if is_num(ru) and 0 <= ru < pt:   # prefill_done includes the cached prefix: count only fresh tokens
+                psuf = f", +{num(max(pr - ru, 0))}/{num(pt - ru)} in flight"
+            elif not is_num(ru):   # Basalt reports the cached prefix only at the first token
+                psuf = f", {num(pr)}/{num(pt)} read incl. cached"
+        elif state == "generating" and is_num(ts) and ts >= 0:
+            gnow = ts if ts else 0.0   # -0.0 would render "-0.0"
+            if is_num(gen) and gen >= 0:
+                gsuf = f", +{num(gen)} in flight"
     lines.append("Prefill    " + fmt_rate(*rate(m, "prompt_tokens_total", "prompt_seconds_total"), now=pnow)
                  + f"   ({num(m.get('prompt_tokens_total'))} tok, "
                  f"{num(m.get('prompt_tokens_cached_total'))} cached{psuf})")
