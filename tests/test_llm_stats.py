@@ -1,6 +1,9 @@
 """llm-stats against stub Maya, Basalt and llama.cpp servers."""
+import contextlib
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -17,6 +20,10 @@ ENGINE = {"model": "deepseek-v4.1-flash", "model_label": "DeepSeek V4.1 · UD-Q2
 LIVE = {"state": "generating", "phase": "thinking", "generated": 6905, "max_tokens": 32000,
         "elapsed_s": 136.1, "tok_s": 70.8, "tok_s_mean": 52.2}
 PROMETHEUS_42 = 'llamacpp:tokens_predicted_total{model="m"} 42\n'
+
+# Maya /metrics while two thinking requests are resumed: reused > prompt (the reused count holds the
+# earlier output too) and engine_generated/decode_ms cover only each request's last segment
+MAYA_RESUMED = json.loads((ROOT / "tests" / "data" / "maya-metrics-resumed.json").read_text())
 
 
 def live_line(stdout):
@@ -35,8 +42,23 @@ def rate_line(stdout, prefix):
     return lines[0]
 
 
+def avg_tok_s(line):
+    """The avg tok/s figure on a rate line, as a float; raises if it is a dash.
+    Tolerates the Maya "avg(N)" label, so it reads the number just before the first "tok/s"."""
+    seg = line.split("avg", 1)[1].split("tok/s")[0]
+    return float(seg.split()[-1])
+
+
+def avg_req_count(line):
+    """The "avg(N)" count Maya labels its avg with, as an int; fails if there is no such label."""
+    m = re.search(r"avg\((\d+)\)", line)
+    assert m, f"no avg(N) label in {line}"
+    return int(m.group(1))
+
+
 class StubHandler(BaseHTTPRequestHandler):
     def respond(self, routes):
+        self.server.hits = getattr(self.server, "hits", 0) + 1
         bad = self.path not in routes
         self.send_response(404 if bad else 200)
         if not bad:
@@ -53,6 +75,7 @@ class StubHandler(BaseHTTPRequestHandler):
 
 
 class MayaServer(HTTPServer):
+    hits = 0               # requests answered: proves that importing llm-stats fetches nothing
     live = LIVE
     metrics_status = 200
     metrics_body = None      # when set, /metrics answers this JSON value instead
@@ -83,6 +106,40 @@ def run_stats(port, script=SCRIPT):
     return subprocess.run(
         [sys.executable, str(script), "--once", "--port", str(port), "--host", "127.0.0.1"],
         capture_output=True, text=True, timeout=30, env=ENV)
+
+
+def load_stats_module(port, script=SCRIPT):
+    """Import llm-stats in-process against a live stub, --engine maya. Importing runs nothing: no argument
+    parsing (sys.argv is never touched) and no polling loop; configure() applies the options the same way
+    main() does when run as a script, then render() draws the first frame; later frames are driven by
+    mutating the stub and calling mod.render()."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    loader = SourceFileLoader("llm_stats_under_test", str(script))
+    spec = importlib.util.spec_from_loader("llm_stats_under_test", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)   # module level only defines: nothing is parsed, fetched or printed
+    mod.configure(mod.p.parse_args(["--engine", "maya", "--host", "127.0.0.1", "--port", str(port)]))
+    return mod, mod.render()
+
+
+def rate_counts(stdout):
+    """The (prefill_prompt, prefill_cached, generate_output) token counts currently on the dashboard.
+    None where the dashboard shows a dash (Maya's prompt total has no Prometheus fallback).
+    The counts sit in the LAST parentheses on the line (the "avg(N)" label has its own), as "P tok, C cached",
+    "P, C cached" or "O tok". Maya may compact them to k/M to fit 80 columns: these tests use small counts and
+    a compacted one fails here rather than silently comparing rounded values."""
+    def counts(line):
+        inner = line[line.rindex("(") + 1:line.rindex(")")]
+        out = []
+        for word in re.split(r"[ ,]", inner):
+            if word in ("", "tok", "cached"):
+                continue
+            assert re.fullmatch(r"-|\d+", word), f"not an exact count: {word!r} in {line}"
+            out.append(None if word == "-" else int(word))
+        return out
+    pre, gen = counts(rate_line(stdout, "Prefill")), counts(rate_line(stdout, "Generate"))
+    return (pre[0], pre[1], gen[0])
 
 
 class LlmStatsMayaTest(unittest.TestCase):
@@ -234,7 +291,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(len(gen), 1, out.stdout)
         self.assertIn("42 tok", gen[0])
 
-    def test_reading_prefill_shows_now_rate_and_in_flight(self):
+    def test_reading_prefill_shows_now_rate_and_live_suffix(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_read": 12000,
                 "prompt_total": 40000, "prompt_tokens": 40000}
         out = run_stats(self.serve(live=live))
@@ -242,19 +299,19 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
         self.assertIn("1234.5", pre)
-        self.assertIn("+12000/40000 in flight", pre)
+        self.assertIn("+12.0k/40.0k live", pre)   # compact: the exact pair would not fit the line
         gen = rate_line(out.stdout, "Generate")
         self.assertTrue(gen.startswith("Generate   last "), gen)   # first column stays "last"
         self.assertNotIn("now", gen)
 
-    def test_reading_in_flight_counts_only_fresh_tokens(self):
+    def test_reading_live_suffix_counts_only_fresh_tokens(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 100000,
                 "prompt_read": 100500, "prompt_total": 102000, "prompt_tokens": 102000}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
-        self.assertIn("+500/2000 in flight", pre)
+        self.assertIn("+500/2.0k live", pre)   # 500 fresh of 2000 (102000 - 100000 reused), not of 102000
 
     def test_reading_stale_prompt_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -268,7 +325,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             line = rate_line(out.stdout, "Prefill")
             self.assertEqual(line, base)   # byte-identical to the idle run
             self.assertIn("last ", line)
-            self.assertNotIn("in flight", line)
+            self.assertNotIn("live", line)
 
     def test_reading_bad_prefill_rate_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -281,7 +338,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             self.assertEqual(out.returncode, 0, f"raw={raw}\n{out.stdout}\n{out.stderr}")
             line = rate_line(out.stdout, "Prefill")
             self.assertEqual(line, base)
-            self.assertNotIn("in flight", line)
+            self.assertNotIn("live", line)
 
     def test_reading_missing_prompt_read_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -293,26 +350,26 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertEqual(pre, base)
         self.assertNotIn("now", pre)
-        self.assertNotIn("in flight", pre)
+        self.assertNotIn("live", pre)
 
-    def test_generating_generate_shows_now_rate_and_in_flight(self):
+    def test_generating_generate_shows_now_rate_and_live_suffix(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": 412}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("31.2", gen)
-        self.assertIn("+412 in flight", gen)
+        self.assertIn("+412 live", gen)
         pre = rate_line(out.stdout, "Prefill")
         self.assertTrue(pre.startswith("Prefill    last "), pre)
-        self.assertNotIn("in flight", pre)
+        self.assertNotIn("live", pre)
 
     def test_generating_generate_line_exact_format(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": 412}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(rate_line(out.stdout, "Generate"),
-                         "Generate   now      31.2 tok/s   avg        - tok/s   (- tok, +412 in flight)")
+                         "Generate   now      31.2 tok/s   avg            - tok/s  (- tok, +412 live)")
 
     def test_generating_prefill_line_stays_idle_form(self):
         # no generating-phase Prefill "now": the line is the plain last/avg idle form
@@ -327,16 +384,16 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(pre, base)
         self.assertIn("last ", pre)
         self.assertNotIn("now", pre)
-        self.assertNotIn("in flight", pre)
+        self.assertNotIn("live", pre)
 
-    def test_generating_missing_generated_shows_now_without_in_flight(self):
+    def test_generating_missing_generated_shows_now_without_live_suffix(self):
         live = {"state": "generating", "tok_s": 31.2}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("31.2", gen)
-        self.assertNotIn("in flight", gen)
+        self.assertNotIn("live", gen)
 
     def test_idle_prefill_generate_use_last(self):
         out = run_stats(self.serve(live={"state": "idle"}))
@@ -344,7 +401,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         for prefix in ("Prefill", "Generate"):
             line = rate_line(out.stdout, prefix)
             self.assertNotIn("now", line)
-            self.assertNotIn("in flight", line)
+            self.assertNotIn("live", line)
 
     def test_unloaded_prefill_generate_use_last(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -364,7 +421,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             line = rate_line(out.stdout, "Generate")
             self.assertEqual(line, base)   # byte-identical to the idle run: port never appears here
             self.assertIn("last ", line)
-            self.assertNotIn("in flight", line)
+            self.assertNotIn("live", line)
 
     def test_reading_finished_prompt_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -378,7 +435,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             pre = rate_line(out.stdout, "Prefill")
             self.assertEqual(pre, base)   # stale: the read can no longer grow
             self.assertNotIn("now", pre)
-            self.assertNotIn("in flight", pre)
+            self.assertNotIn("live", pre)
 
     def test_reading_non_positive_prefill_rate_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -392,7 +449,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             pre = rate_line(out.stdout, "Prefill")
             self.assertEqual(pre, base)
             self.assertNotIn("now", pre)
-            self.assertNotIn("in flight", pre)
+            self.assertNotIn("live", pre)
 
     def test_reading_prompt_read_past_total_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -405,7 +462,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertEqual(pre, base)
         self.assertNotIn("now", pre)
-        self.assertNotIn("in flight", pre)
+        self.assertNotIn("live", pre)
 
     def test_reading_negative_reused_does_not_subtract(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": -1,
@@ -414,7 +471,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
-        self.assertIn("+100/200 in flight", pre)
+        self.assertIn("+100/200 live", pre)
 
     def test_reading_negative_prompt_read_falls_back_to_idle_prefill_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -427,9 +484,9 @@ class LlmStatsMayaTest(unittest.TestCase):
         pre = rate_line(out.stdout, "Prefill")
         self.assertEqual(pre, base)   # negative prompt_read: no live prefill at all
         self.assertNotIn("now", pre)
-        self.assertNotIn("in flight", pre)
+        self.assertNotIn("live", pre)
 
-    def test_reading_reused_covering_the_prompt_shows_now_without_in_flight(self):
+    def test_reading_reused_covering_the_prompt_shows_now_without_live_suffix(self):
         for ru, read, total in [(40000, 20000, 40000),    # reused == total
                                 (200000, 100500, 102000)]:   # reused past total
             live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": ru,
@@ -439,7 +496,7 @@ class LlmStatsMayaTest(unittest.TestCase):
             pre = rate_line(out.stdout, "Prefill")
             self.assertIn("now ", pre)
             self.assertIn("1234.5", pre)
-            self.assertNotIn("in flight", pre)   # nothing fresh left to count
+            self.assertNotIn("live", pre)   # nothing fresh left to count
 
     def test_reading_reused_above_read_clamps_fresh_read_to_zero(self):
         live = {"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 150,
@@ -448,7 +505,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         pre = rate_line(out.stdout, "Prefill")
         self.assertIn("now ", pre)
-        self.assertIn("+0/50 in flight", pre)
+        self.assertIn("+0/50 live", pre)
 
     def test_generating_negative_tok_s_falls_back_to_idle_generate_line(self):
         idle = run_stats(self.serve(live={"state": "idle"}))
@@ -460,7 +517,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         gen = rate_line(out.stdout, "Generate")
         self.assertEqual(gen, base)
         self.assertIn("last ", gen)
-        self.assertNotIn("in flight", gen)
+        self.assertNotIn("live", gen)
 
     def test_generating_zero_tok_s_shows_now(self):
         live = {"state": "generating", "tok_s": 0.0, "generated": 3}
@@ -469,7 +526,7 @@ class LlmStatsMayaTest(unittest.TestCase):
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("0.0 tok/s", gen)
-        self.assertIn("+3 in flight", gen)
+        self.assertIn("+3 live", gen)
 
     def test_generating_negative_zero_tok_s_shows_zero(self):
         body = '{"live": {"state": "generating", "tok_s": -0.0, "generated": 3}}'   # raw text: -0.0 survives parsing
@@ -480,14 +537,447 @@ class LlmStatsMayaTest(unittest.TestCase):
         self.assertIn("0.0 tok/s", gen)
         self.assertNotIn("-0.0", gen)
 
-    def test_generating_negative_generated_shows_now_without_in_flight(self):
+    def test_generating_negative_generated_shows_now_without_live_suffix(self):
         live = {"state": "generating", "tok_s": 31.2, "generated": -1}
         out = run_stats(self.serve(live=live))
         self.assertEqual(out.returncode, 0, out.stderr)
         gen = rate_line(out.stdout, "Generate")
         self.assertIn("now ", gen)
         self.assertIn("31.2", gen)
-        self.assertNotIn("in flight", gen)
+        self.assertNotIn("live", gen)
+
+    def test_resumed_maya_totals_show_no_negative_and_pairs_drive_generate(self):
+        # the saved bug moment: reused > prompt in totals (a resumed request's reused holds the earlier output
+        # too), and engine_generated/decode_ms cover only each request's last segment. Nothing may go negative:
+        # the Prefill count is Maya's growing prompt total 37939 (never prompt minus reused, which is negative
+        # here), Prefill last/avg are "-" (both requests are visibly multi-call and reused > prompt),
+        # Generate last is the newest request's own decode_tok_s, and Generate avg is the honest pair ratio
+        # 1405 / 23.5 s = 59.8 labelled as its 2 requests; the Generate count is the true output total 66983.
+        out = run_stats(self.serve(metrics_body=MAYA_RESUMED))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIsNone(re.search(r"-\d", pre), pre)   # never a negative count
+        self.assertEqual(pre, "Prefill    last        - tok/s   avg            - tok/s"
+                              "  (37939, 103515 cached)")   # 79 columns: no room for the word "tok"
+        gen = rate_line(out.stdout, "Generate")
+        self.assertIsNone(re.search(r"-\d", gen), gen)
+        self.assertIn("last     54.5 tok/s", gen)         # the newest request's own decode rate
+        self.assertAlmostEqual(avg_tok_s(gen), 59.8, delta=0.1)
+        self.assertEqual(avg_req_count(gen), 2)           # the label says which requests the avg covers
+        self.assertIn("(66983 tok)", gen)                 # the running output total, not the pair sum
+
+    def test_normal_maya_totals_match_hand_computation(self):
+        # reused < prompt for every request: the Prefill count is Maya's prompt total 5000 with 1000 cached;
+        # Prefill avg is the fresh-over-ms ratio (5000-1000) / 2.5 s = 1600 over 1 request (no prefill_tok_s so
+        # last is "-"); Generate last is the newest request's decode_tok_s 60, avg 900 / 15 s = 60 over 1
+        # request, and the Generate count is output_tokens.
+        body = {"engine": ENGINE, "live": {"state": "idle"},
+                "requests": [{"prompt_tokens": 5000, "reused": 1000, "output_tokens": 900,
+                              "engine_generated": 900, "prompt_ms": 2500.0, "decode_ms": 15000.0,
+                              "decode_tok_s": 60.0}],
+                "totals": {"requests": 1, "prompt_tokens": 5000, "reused": 1000, "output_tokens": 900,
+                           "prompt_ms": 2500.0, "decode_ms": 15000.0}}
+        prom = ('llamacpp:prompt_tokens_total{model="m"} 4000\n'
+                'llamacpp:prompt_tokens_cached_total{model="m"} 1000\n'
+                'llamacpp:prompt_seconds_total{model="m"} 2.5\n'
+                'llamacpp:tokens_predicted_total{model="m"} 900\n'
+                'llamacpp:tokens_predicted_seconds_total{model="m"} 15.0\n')
+        out = run_stats(self.serve(metrics_body=body, prometheus=prom))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(rate_line(out.stdout, "Prefill"),
+                         "Prefill    last        - tok/s   avg(1)    1600.0 tok/s  (5000 tok, 1000 cached)")
+        self.assertEqual(rate_line(out.stdout, "Generate"),
+                         "Generate   last     60.0 tok/s   avg(1)      60.0 tok/s  (900 tok)")
+
+    def test_maya_generate_avg_dashes_when_no_pairs(self):
+        # a resumed request with no engine_generated: no consistent pair, so the Generate avg is "-" (no bogus
+        # totals avg), while last stays the request's own 54.5; the row is "unknown" (output 33512 with no
+        # generated) with reused > prompt, so the Prefill last/avg dash, and the Prefill count is the growing
+        # prompt total 17651 (the mirror's -32795 = prompt minus reused never reaches the dashboard)
+        body = {"engine": ENGINE, "live": {"state": "idle"},
+                "requests": [{"prompt_tokens": 17651, "reused": 50446, "output_tokens": 33512,
+                              "decode_ms": 13137.2, "decode_tok_s": 54.5}],
+                "totals": {"requests": 1, "prompt_tokens": 17651, "reused": 50446, "output_tokens": 33512,
+                           "prompt_ms": 181.0, "decode_ms": 13137.2}}
+        prom = ('llamacpp:prompt_tokens_total{model="m"} -32795\n'
+                'llamacpp:prompt_tokens_cached_total{model="m"} 50446\n'
+                'llamacpp:prompt_seconds_total{model="m"} 0.181\n'
+                'llamacpp:tokens_predicted_total{model="m"} 33512\n'
+                'llamacpp:tokens_predicted_seconds_total{model="m"} 13.1372\n')
+        out = run_stats(self.serve(metrics_body=body, prometheus=prom))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIsNone(re.search(r"-\d", pre), pre)
+        self.assertEqual(pre, "Prefill    last        - tok/s   avg            - tok/s"
+                              "  (17651, 50446 cached)")
+        self.assertEqual(rate_line(out.stdout, "Generate"),
+                         "Generate   last     54.5 tok/s   avg            - tok/s  (33512 tok)")
+
+    def _maya_server(self):
+        server = MayaServer(("127.0.0.1", 0), MayaHandler)
+        server.live = {"state": "idle"}
+        server.prometheus = ""    # counts come from the JSON totals, not the Prometheus mirror
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    @staticmethod
+    def _req(k):
+        prompt, reused, out, gen = 2000 + 100 * k, 500 + 50 * k, 150 + 10 * k, 150 + 10 * k
+        pms, dms = 1000.0 + 10 * k, 3000.0 + 20 * k
+        return {"prompt_tokens": prompt, "reused": reused, "output_tokens": out,
+                "engine_generated": gen, "prompt_ms": pms, "decode_ms": dms,
+                "decode_tok_s": round(gen / (dms / 1000), 1),
+                "prefill_tok_s": round((prompt - reused) / (pms / 1000), 1)}
+
+    @staticmethod
+    def _totals(reqs):
+        return {"requests": len(reqs),
+                "prompt_tokens": sum(r["prompt_tokens"] for r in reqs),
+                "reused": sum(r["reused"] for r in reqs),
+                "output_tokens": sum(r["output_tokens"] for r in reqs),
+                "prompt_ms": sum(r["prompt_ms"] for r in reqs),
+                "decode_ms": sum(r["decode_ms"] for r in reqs)}
+
+    def _body(self, window, seen):
+        return {"engine": ENGINE, "live": {"state": "idle"}, "requests": window,
+                "totals": self._totals(seen)}   # totals accumulate over every request ever seen
+
+    def test_maya_multi_frame_rolling_window_never_negative_or_receding(self):
+        # Maya keeps only the newest 12 requests; across frames a 13th request arrives and pushes the oldest
+        # out of that window. Rates never use frame-to-frame counter differences, so a rolling-out request must
+        # not make a rate negative, and the running token counts must not decrease.
+        server = self._maya_server()
+        base = [self._req(k) for k in range(12)]        # 12 finished requests, newest first
+        new = {"prompt_tokens": 5000, "reused": 1000, "output_tokens": 300, "engine_generated": 300,
+               "prompt_ms": 1500.0, "decode_ms": 4000.0, "decode_tok_s": 75.0, "prefill_tok_s": 2666.7}
+        server.metrics_body = self._body(base, base)    # frame 1: the 12 requests are the whole history
+        mod, frame1 = load_stats_module(server.server_address[1])
+        server.metrics_body = self._body([new] + base[:11], [new] + base)   # frame 2: 13 seen, oldest dropped
+        frame2 = mod.render()
+        c1, c2 = rate_counts(frame1), rate_counts(frame2)
+        for stdout in (frame1, frame2):
+            for prefix in ("Prefill", "Generate"):
+                self.assertIsNone(re.search(r"-\d", rate_line(stdout, prefix)), stdout)
+        self.assertTrue(all(b >= a for a, b in zip(c1, c2)), f"counts decreased: {c1} -> {c2}")
+        self.assertGreater(c2, c1)   # a real new request grew the running totals
+
+    def test_maya_failed_json_frame_dashes_rates_without_jump(self):
+        # three frames where the middle one cannot fetch /metrics: rates show "-" that frame, the cached and
+        # output counts fall back to the running Prometheus mirror, and nothing goes negative, implausible or
+        # discontinuous; the mirror's prompt_tokens_total is prompt minus reused, a different quantity than
+        # Maya's prompt total, so only the prompt count dashes that frame; the good frames render real rates.
+        server = self._maya_server()
+        base = [self._req(k) for k in range(4)]
+        fresh = sum(r["prompt_tokens"] - r["reused"] for r in base)
+        reused = sum(r["reused"] for r in base)
+        out = sum(r["output_tokens"] for r in base)
+        prom = ('llamacpp:prompt_tokens_total{model="m"} %d\n'
+                'llamacpp:prompt_tokens_cached_total{model="m"} %d\n'
+                'llamacpp:prompt_seconds_total{model="m"} %s\n'
+                'llamacpp:tokens_predicted_total{model="m"} %d\n'
+                'llamacpp:tokens_predicted_seconds_total{model="m"} %s\n'
+                % (fresh, reused, sum(r["prompt_ms"] for r in base) / 1000, out,
+                   sum(r["decode_ms"] for r in base) / 1000))
+        server.prometheus = prom
+        server.metrics_body = self._body(base, base)
+        mod, good1 = load_stats_module(server.server_address[1])
+        server.metrics_body = None       # /metrics cannot be fetched this frame
+        server.metrics_status = 404
+        bad = mod.render()
+        server.metrics_status = 200
+        server.metrics_body = self._body(base, base)   # JSON is back
+        good2 = mod.render()
+        for stdout in (good1, bad, good2):
+            for prefix in ("Prefill", "Generate"):
+                line = rate_line(stdout, prefix)
+                self.assertIsNone(re.search(r"-\d", line), stdout)   # never a negative
+                try:
+                    a = avg_tok_s(line)
+                except ValueError:
+                    continue   # avg is a dash: nothing to bound
+                self.assertLess(0, a, line)
+                self.assertLess(a, 100000, f"implausible avg in {line}")
+        # the failed frame dashes both last and avg; the mirror keeps the cached and output counts continuous,
+        # while the prompt count shows "-" rather than the mirror's different quantity (prompt minus reused)
+        for prefix in ("Prefill", "Generate"):
+            self.assertIn("last        - tok/s", rate_line(bad, prefix))
+            self.assertRegex(rate_line(bad, prefix), r"avg +- tok/s")   # padded "avg" label, then the dash
+        self.assertIn("(- tok", rate_line(bad, "Prefill"))
+        self.assertEqual(rate_counts(bad), (None, reused, out))
+        self.assertEqual(rate_counts(bad)[1:], rate_counts(good2)[1:])   # no jump in the mirrored counts
+        self.assertEqual(rate_counts(good1)[0], sum(r["prompt_tokens"] for r in base))
+
+    def test_maya_prefill_prompt_count_never_drops_when_a_multicall_finishes(self):
+        # a multi-call request adds far more to reused than to prompt_tokens, so the old fresh count
+        # (prompt minus reused) dropped by thousands when one finished; the Prefill count is Maya's running
+        # prompt total, which only grows: a resumed request (prompt 17651, reused 50446, output 33512)
+        # completing between two frames may not decrease the Prefill count or the Generate count.
+        server = self._maya_server()
+        base = [self._req(k) for k in range(3)]
+        multi = {"prompt_tokens": 17651, "reused": 50446, "output_tokens": 33512,
+                 "engine_generated": 716, "prompt_ms": 181.0, "decode_ms": 13137.2, "decode_tok_s": 54.5}
+        server.metrics_body = self._body(base, base)
+        mod, frame1 = load_stats_module(server.server_address[1])
+        self.assertEqual(rate_counts(frame1)[0], sum(r["prompt_tokens"] for r in base))
+        server.metrics_body = self._body([multi] + base, [multi] + base)   # the multi-call request finished
+        frame2 = mod.render()
+        c1, c2 = rate_counts(frame1), rate_counts(frame2)
+        for stdout in (frame1, frame2):
+            for prefix in ("Prefill", "Generate"):
+                self.assertIsNone(re.search(r"-\d", rate_line(stdout, prefix)), stdout)
+        self.assertTrue(all(b >= a for a, b in zip(c1, c2)), f"counts decreased: {c1} -> {c2}")
+        self.assertEqual(c2, (c1[0] + 17651, c1[1] + 50446, c1[2] + 33512))   # the whole request, not a clamp
+
+    def test_maya_footer_names_the_listed_requests_window(self):
+        # Maya's avg covers only the requests its list holds, not the server's whole uptime
+        out = run_stats(self.serve(metrics_body=MAYA_RESUMED))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        footer = "last = newest request, avg(N) = over the N listed. Ctrl+C to exit."
+        self.assertIn(footer, out.stdout)
+        self.assertLessEqual(len(footer), 80)
+        self.assertNotIn("since server start", out.stdout)
+
+    def test_maya_multicall_newest_dashes_prefill_last_and_is_out_of_the_avg(self):
+        # single-call rows have output_tokens == engine_generated, so output > 1.1 * generated + 16 marks a
+        # visibly multi-call row, whose prompt_ms covers only its last call. The newest row here is multi-call
+        # with reused < prompt (it would otherwise count), so Prefill last is "-" rather than the row below:
+        # the footer promises the NEWEST request. The avg still uses the one consistent row, (2000-500) fresh /
+        # 1.0 s = 1500.0, not the multi-call row's (10000-2000) / 1.0 s = 8000.0. Generate is untouched: its
+        # last is still the newest row's decode_tok_s and both rows have consistent pairs for the avg.
+        good = self._req(0)   # prompt 2000, reused 500, prompt_ms 1000 → prefill_tok_s 1500.0
+        multi = {"prompt_tokens": 10000, "reused": 2000, "output_tokens": 9000, "engine_generated": 500,
+                 "prompt_ms": 1000.0, "decode_ms": 5000.0, "decode_tok_s": 100.0, "prefill_tok_s": 8000.0}
+        out = run_stats(self.serve(metrics_body={"engine": ENGINE, "live": {"state": "idle"},
+                                                 "requests": [multi, good],
+                                                 "totals": self._totals([multi, good])}))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        pre = rate_line(out.stdout, "Prefill")
+        self.assertIn("last        - tok/s", pre)   # never the multi-call row's 8000, nor the next row's 1500
+        self.assertAlmostEqual(avg_tok_s(pre), 1500.0, delta=0.1)
+        self.assertEqual(avg_req_count(pre), 1)       # the multi-call row is out of the avg window
+        gen = rate_line(out.stdout, "Generate")
+        self.assertIn("last    100.0 tok/s", gen)    # decode rates stay on the newest row
+        self.assertEqual(avg_req_count(gen), 2)
+        # a list of only multi-call rows leaves nothing consistent: Prefill last and avg both dash
+        only = run_stats(self.serve(metrics_body={"engine": ENGINE, "live": {"state": "idle"},
+                                                  "requests": [multi], "totals": self._totals([multi])}))
+        self.assertEqual(only.returncode, 0, only.stderr)
+        pre = rate_line(only.stdout, "Prefill")
+        self.assertIn("last        - tok/s", pre)
+        self.assertRegex(pre, r"avg +- tok/s")
+
+    # the review row: a request of two roughly equal engine calls (output = 2 * engine_generated), which the
+    # old output > 2 * generated + 16 test missed; 200 > 1.1 * 100 + 16 catches it
+    TWO_CALLS = {"prompt_tokens": 5000, "reused": 1000, "output_tokens": 200, "engine_generated": 100,
+                 "prompt_ms": 1000.0, "prefill_tok_s": 4000.0, "decode_ms": 1000.0, "decode_tok_s": 100.0}
+
+    def _prefill_of(self, row):
+        out = run_stats(self.serve(metrics_body={"engine": ENGINE, "live": {"state": "idle"},
+                                                 "requests": [row], "totals": self._totals([row])}))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return rate_line(out.stdout, "Prefill")
+
+    def assert_prefill_dashes(self, pre):
+        self.assertIn("last        - tok/s", pre)     # newest row flagged: last shows "-"
+        self.assertRegex(pre, r"avg +- tok/s")        # and nothing is left for the avg: no avg(N) at all
+
+    def test_maya_two_equal_calls_row_is_multi_call(self):
+        # output 200 vs engine_generated 100 (two equal calls): flagged multi-call, so its own
+        # prefill_tok_s 4000.0 never reaches the dashboard, and it is out of the Prefill avg
+        pre = self._prefill_of(self.TWO_CALLS)
+        self.assert_prefill_dashes(pre)
+        self.assertNotIn("4000.0", pre)
+
+    def test_maya_unknown_generated_rows_are_out_of_prefill(self):
+        # engine_generated missing, None or 0 with output 200 > 16 is "unknown": nothing ties the row's
+        # prompt_ms to its whole prompt, so the row is treated like a multi-call one: Prefill last "-", avg "-"
+        for drop in ("missing", None, 0):
+            with self.subTest(engine_generated=drop):
+                if drop == "missing":
+                    row = {k: v for k, v in self.TWO_CALLS.items() if k != "engine_generated"}
+                else:
+                    row = {**self.TWO_CALLS, "engine_generated": drop}
+                self.assert_prefill_dashes(self._prefill_of(row))
+
+    def test_maya_single_call_row_close_to_generated_is_counted(self):
+        # output 205 vs engine_generated 200: a single call with a slightly faster-growing output, 205 is not
+        # over 1.1 * 200 + 16 = 236, so the row keeps its Prefill last and its avg(1) = (5000-1000) / 1.0 s
+        row = {**self.TWO_CALLS, "output_tokens": 205, "engine_generated": 200}
+        pre = self._prefill_of(row)
+        self.assertRegex(pre, r"last\s+4000\.0 tok/s")
+        self.assertAlmostEqual(avg_tok_s(pre), 4000.0, delta=0.1)
+        self.assertEqual(avg_req_count(pre), 1)
+
+    def test_maya_multi_call_flags(self):
+        # the flag itself, beyond the two rows above: equal calls and any bigger output are multi-call,
+        # missing/None/0 generated with output > 16 is unknown, a small or absent output is unjudgeable,
+        # and output close to the generated stays a counted single call
+        server = self._maya_server()
+        server.metrics_body = self._body([], [])
+        mod, _ = load_stats_module(server.server_address[1])
+        row = lambda **kw: {**{"output_tokens": 200, "engine_generated": 100}, **kw}   # noqa: E731
+        for r, want in [(row(), True),                                   # output == 2 * generated
+                        (row(output_tokens=127), True),                  # just over 1.1 * 100 + 16 = 126
+                        (row(output_tokens=126), False),                 # exactly at the bound: single call
+                        (row(output_tokens=205, engine_generated=200), False),
+                        (row(engine_generated=None), True),              # unknown: 200 > 16
+                        (row(engine_generated=0), True),
+                        ({**row(), "engine_generated": "100"}, True),    # a non-number generated is no proof
+                        ({"output_tokens": 17}, True),                   # unknown even just past 16
+                        ({"output_tokens": 16}, False),                  # a small output: not flagged
+                        ({}, False),                                     # no output to compare: unjudgeable
+                        ({"engine_generated": 100}, False)]:
+            self.assertIs(mod.maya_multi_call(r), want, r)
+
+    def test_maya_negative_totals_clamp_to_zero(self):
+        # a malformed negative running total must render 0, never a negative count: the JSON totals clamp,
+        # and so do the mirrored cached and output counts of a frame whose JSON fetch failed
+        out = run_stats(self.serve(metrics_body={
+            "engine": ENGINE, "live": {"state": "idle"}, "requests": [],
+            "totals": {"requests": 1, "prompt_tokens": -5, "reused": -7, "output_tokens": -3}}))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for prefix in ("Prefill", "Generate"):
+            self.assertIsNone(re.search(r"-\d", rate_line(out.stdout, prefix)), out.stdout)
+        self.assertIn("(0 tok, 0 cached)", rate_line(out.stdout, "Prefill"))
+        self.assertIn("(0 tok)", rate_line(out.stdout, "Generate"))
+        self.assertEqual(rate_counts(out.stdout), (0, 0, 0))
+        prom = ('llamacpp:prompt_tokens_total{model="m"} -4000\n'
+                'llamacpp:prompt_tokens_cached_total{model="m"} -7\n'
+                'llamacpp:tokens_predicted_total{model="m"} -9\n')
+        out = run_stats(self.serve(metrics_status=404, prometheus=prom))   # JSON fetch failed
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for prefix in ("Prefill", "Generate"):
+            self.assertIsNone(re.search(r"-\d", rate_line(out.stdout, prefix)), out.stdout)
+        self.assertEqual(rate_counts(out.stdout), (None, 0, 0))   # the prompt total still has no fallback
+
+    def test_maya_avg_labels_padded_so_paren_columns_line_up(self):
+        # "avg(12)" is wider than "avg" and grows again from N = 9 to 10, so Maya pads the label to a fixed
+        # width: the "avg(N)" parens and the trailing count parens sit at the same index on the Prefill and
+        # Generate lines for N = 2, 9 and 12, and for "-" too.
+        server = self._maya_server()
+        server.metrics_body = self._body([], [])
+        mod, _ = load_stats_module(server.server_address[1])
+        for n in (2, 9, 12):
+            reqs = [self._req(k) for k in range(n)]
+            server.metrics_body = self._body(reqs, reqs)
+            frame = mod.render()
+            pre, gen = rate_line(frame, "Prefill"), rate_line(frame, "Generate")
+            self.assertEqual(avg_req_count(pre), n, pre)
+            self.assertEqual(avg_req_count(gen), n, gen)
+            self.assertEqual(pre.index("("), gen.index("("), f"N={n}:\n{pre}\n{gen}")   # the "avg(N)" column
+            self.assertEqual(pre.rindex("("), gen.rindex("("), f"N={n}:\n{pre}\n{gen}")  # the count column
+        server.metrics_body = self._body([], [])   # both avgs "-": no "avg(N)" label at all
+        frame = mod.render()
+        pre, gen = rate_line(frame, "Prefill"), rate_line(frame, "Generate")
+        self.assertNotIn("avg(", pre)
+        self.assertNotIn("avg(", gen)
+        self.assertEqual(pre.rindex("("), gen.rindex("("), f"{pre}\n{gen}")
+        # a count on one line and a dash on the other must not shift the trailing columns either
+        keep = [self._req(k) for k in range(9)]
+        nodec = [{k: v for k, v in r.items() if k not in ("decode_ms", "decode_tok_s")}
+                 for r in keep]   # engine_generated kept (a missing one is "unknown", out of Prefill):
+                                  # no decode_ms pair, so Prefill "avg(9)" and Generate "-"
+        server.metrics_body = {"engine": ENGINE, "live": {"state": "idle"}, "requests": nodec,
+                               "totals": self._totals(keep)}
+        frame = mod.render()
+        pre, gen = rate_line(frame, "Prefill"), rate_line(frame, "Generate")
+        self.assertIn("avg(9)", pre)
+        self.assertNotIn("avg(", gen)
+        self.assertEqual(pre.rindex("("), gen.rindex("("), f"{pre}\n{gen}")
+
+    def test_importing_the_module_does_not_start_the_polling_loop(self):
+        # importing must parse no arguments, fetch nothing and print nothing, whatever sys.argv holds (even
+        # the script's own --once args); rendering still works once configure() has applied parsed options
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        server = self._maya_server()
+        server.metrics_body = self._body([], [])
+        loader = SourceFileLoader("llm_stats_import_check", str(SCRIPT))
+        mod = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("llm_stats_import_check", loader))
+        argv, out = sys.argv, io.StringIO()
+        sys.argv = ["llm-stats", "--once", "--engine", "maya", "--host", "127.0.0.1",
+                    "--port", str(server.server_address[1])]
+        try:
+            with contextlib.redirect_stdout(out):
+                loader.exec_module(mod)
+        finally:
+            sys.argv = argv
+        self.assertEqual(server.hits, 0, "importing llm-stats reached the server")
+        self.assertEqual(out.getvalue(), "", "importing llm-stats printed a dashboard")
+        mod.configure(mod.p.parse_args(["--engine", "maya", "--host", "127.0.0.1",
+                                        "--port", str(server.server_address[1])]))
+        self.assertIn("Prefill", mod.render())   # rendering still works when asked for
+
+    def test_importing_under_pytest_argv_does_not_exit(self):
+        # argparse at module level made "import llm-stats" under pytest's own sys.argv exit(2) before the
+        # tests ever ran: parsing belongs in main(), so exec_module must neither exit nor poll
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        server = self._maya_server()
+        server.metrics_body = self._body([], [])
+        loader = SourceFileLoader("llm_stats_pytest_argv", str(SCRIPT))
+        mod = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("llm_stats_pytest_argv", loader))
+        argv, out = sys.argv, io.StringIO()
+        sys.argv = ["pytest", "-q"]
+        try:
+            with contextlib.redirect_stdout(out):
+                loader.exec_module(mod)   # SystemExit here (or any hit on the stub) fails the test
+        finally:
+            sys.argv = argv
+        self.assertEqual(server.hits, 0, "importing llm-stats reached the server")
+        self.assertEqual(out.getvalue(), "", "importing llm-stats printed a dashboard")
+        mod.configure(mod.p.parse_args(["--engine", "maya", "--host", "127.0.0.1",
+                                        "--port", str(server.server_address[1])]))
+        self.assertIn("Prefill", mod.render())
+
+    def test_maya_rate_lines_and_footer_fit_80_columns(self):
+        # 8-digit running totals, with and without a live request: Prefill, Generate and the footer all stay
+        # within 80 columns. The counts compact to k/M ("12.3M, 87.7M cached") and a live request's progress
+        # alone is shown when the totals would not fit beside it ("+12.3M/87.7M live").
+        server = self._maya_server()
+        reqs = [self._req(k) for k in range(3)]
+        big = {"prompt_tokens": 12345678, "reused": 87654321, "output_tokens": 98765432}
+        server.metrics_body = {"engine": ENGINE, "live": {"state": "idle"}, "requests": reqs, "totals": big}
+        mod, _ = load_stats_module(server.server_address[1])
+        cases = [
+            ({"state": "idle"}, "(12.3M, 87.7M cached)", "(98765432 tok)"),   # exact counts still fit Generate
+            ({"state": "reading", "prefill_tok_s_mean": 1234.5, "prompt_reused": 10, "prompt_read": 12345678,
+              "prompt_total": 87654321, "prompt_tokens": 87654321},           # 8-digit read of an 8-digit prompt
+             "(+12.3M/87.7M live)", "(98765432 tok)"),
+            ({"state": "generating", "tok_s": 31.2, "generated": 12345678},
+             "(12.3M, 87.7M cached)", "(98.8M, +12.3M live)"),
+        ]
+        for live, want_pre, want_gen in cases:
+            server.metrics_body = {"engine": ENGINE, "live": live, "requests": reqs, "totals": big}
+            frame = mod.render()
+            pre, gen = rate_line(frame, "Prefill"), rate_line(frame, "Generate")
+            self.assertIn(want_pre, pre)     # the compact form is what rendered, not a wider one
+            self.assertIn(want_gen, gen)
+            self.assertLessEqual(len(pre), 80, pre)
+            self.assertLessEqual(len(gen), 80, gen)
+            self.assertLessEqual(len(frame.splitlines()[-1]), 80, frame)   # the footer
+            self.assertEqual(pre.rindex("("), gen.rindex("("), f"{pre}\n{gen}")
+        # the widest case that still keeps exact counts: two 6-digit ones, "(999949, 987654 cached)", which
+        # fills line 80 exactly; the first 7-digit count is where the k/M compaction takes over
+        server.metrics_body = {"engine": ENGINE, "live": {"state": "idle"}, "requests": reqs,
+                               "totals": {"prompt_tokens": 999949, "reused": 987654, "output_tokens": 1234}}
+        pre = rate_line(mod.render(), "Prefill")
+        self.assertIn("(999949, 987654 cached)", pre)
+        self.assertEqual(len(pre), 80, pre)
+        server.metrics_body = {"engine": ENGINE, "live": {"state": "idle"}, "requests": reqs,
+                               "totals": {"prompt_tokens": 9999999, "reused": 9876543, "output_tokens": 1234}}
+        pre = rate_line(mod.render(), "Prefill")
+        self.assertIn("(10.0M, 9.9M cached)", pre)
+        self.assertLessEqual(len(pre), 80, pre)
+        # maya_count stays within 6 characters whatever the count, which is what keeps the lines within 80
+        self.assertEqual(max(len(mod.maya_count(v)) for v in
+                             (0, 999, 1000, 48987, 999949, 999999, 12345678, 987654321,
+                              10 ** 12, 10 ** 15, 10 ** 18 - 1)), 6)
+        self.assertEqual(mod.maya_count(999999), "1.0M")   # never "1000.0k"
 
 
 BASALT_ENGINE = {"version": "0.4.1", "quant": "Q4_K_XL", "kv": "fp16"}
@@ -590,6 +1080,17 @@ class LlmStatsHeaderTest(unittest.TestCase):
         out = self.assert_header_unchanged(LlamaCppHandler, self.GOLDEN["llamacpp"])
         for prefix, golden in self.GOLDEN_RATES["llamacpp"].items():
             self.assertEqual(rate_line(out.stdout, prefix), golden)
+
+    def test_footer_unchanged_for_basalt_and_llamacpp(self):
+        # only Maya's footer changed: the others still claim the avg spans the server's whole uptime
+        for handler in (BasaltHandler, LlamaCppHandler):
+            server = serve(handler)
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            out = run_stats(server.server_address[1])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("last = most recent request, avg = since server start. Ctrl+C to exit.", out.stdout)
+            self.assertNotIn("Maya lists", out.stdout)
 
 
 class LlmStatsBasaltLiveTest(unittest.TestCase):
