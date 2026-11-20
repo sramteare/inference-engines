@@ -21,10 +21,102 @@ starttime_of() {  # $1 pid -> start time (field 22 of /proc/<pid>/stat)
   set -- $rest          # original field N is now positional $((N - 2)), so 22 -> $20
   printf '%s' "${20:-}"
 }
+nvsmi() {  # nvidia-smi, guarded by a timeout when coreutils' timeout exists
+  # --foreground keeps nvidia-smi in our process group so Ctrl-C reaches a hung
+  # nvidia-smi; --kill-after catches one that ignores SIGTERM. Without timeout
+  # on PATH, run nvidia-smi unguarded rather than lose the check entirely.
+  # NVSMI_TIMEOUT_S (default 10) lets the GPU wait shrink each poll's timeout to
+  # the time left before its deadline; --kill-after is always kept.
+  local t="${NVSMI_TIMEOUT_S:-10}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --foreground --kill-after=2 "$t" nvidia-smi "$@"
+  else
+    nvidia-smi "$@"
+  fi
+}
+# GPU-holding binaries we manage. Ownership is decided only by this exact
+# executable name: cmdlines can mention these names in unrelated arguments.
+readonly -a GPU_SERVER_NAMES=(maya-ds4 llama-server basalt basalt-bench)
+# Root for /proc lookups. Override (empty/nonexistent dir) makes the exe read
+# below fail, which is how the tests reach the name-based fallback.
+PROC_ROOT="${PROC_ROOT:-/proc}"
+gpu_holders() {  # "<pid> <used_mib> <name>"; return 2 when the query fails, 3 when nvidia-smi is absent
+  command -v nvidia-smi >/dev/null 2>&1 || return 3
+  local out line pid name mem base n exe exec_part
+  if ! out="$(nvsmi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null)"; then
+    return 2
+  fi
+  while IFS= read -r line; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    [[ "$line" == *,* ]] || continue
+    # process_name may be a whole command line with commas and spaces, so take
+    # pid before the first comma, mem after the last, and the name in between.
+    pid="${line%%,*}"
+    mem="${line##*,}"
+    name="${line#*,}"; name="${name%,*}"
+    pid="${pid//[[:space:]]/}"
+    mem="${mem//[[:space:]]/}"
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    base=""
+    # Identify by the real executable: its basename must equal a known name.
+    # Immune to spaces in the path and never matches an argument.
+    if exe="$(readlink "$PROC_ROOT/$pid/exe" 2>/dev/null)" && [[ -n "$exe" ]]; then
+      # Binary rebuilt while its process runs: Linux reports the link target
+      # with a " (deleted)" suffix; strip one so the basename still matches.
+      exe="${exe%" (deleted)"}"
+      exe="${exe##*/}"
+      for n in "${GPU_SERVER_NAMES[@]}"; do
+        if [[ "$exe" == "$n" ]]; then
+          base="$n"
+          break
+        fi
+      done
+    else
+      # /proc exe unreadable (another user's process, or it exited between the
+      # nvidia-smi query and now): fall back to the reported name, but only the
+      # executable part. Arguments start at the first " -".
+      exec_part="$name"
+      [[ "$exec_part" == *" -"* ]] && exec_part="${exec_part%%" -"*}"
+      for n in "${GPU_SERVER_NAMES[@]}"; do
+        if [[ "${exec_part##*/}" == "$n" || "$name" == "$n "* ]]; then
+          base="$n"
+          break
+        fi
+      done
+    fi
+    [[ -n "$base" ]] || continue
+    printf '%s %s %s\n' "$pid" "$mem" "$base"
+  done <<< "$out"
+  return 0
+}
+# Never inherit a caller's CONFIG_TMP: the cleanup below would delete it.
+CONFIG_TMP=""
+# Generated engine configs live in CONFIG_TMP until the launch checks pass.
+cleanup_config_tmp() {
+  if [[ -n "${CONFIG_TMP:-}" && -f "${CONFIG_TMP}" ]]; then
+    rm -f -- "$CONFIG_TMP"
+  fi
+  return 0
+}
+# Remove the generated temp file and forget its path, so the traps above can
+# never touch a file once this script is done with it.
+discard_config_tmp() {
+  if [[ -n "${CONFIG_TMP:-}" ]]; then
+    rm -f -- "$CONFIG_TMP"
+    CONFIG_TMP=""
+  fi
+}
+trap cleanup_config_tmp EXIT
+# A trap handler that only returns would let the script continue after Ctrl-C,
+# so re-raise the signal (default disposition) after cleaning up the temp file.
+trap 'cleanup_config_tmp; trap - INT; kill -INT $$' INT
+trap 'cleanup_config_tmp; trap - TERM; kill -TERM $$' TERM
 
 main() {
   # Not `local`: that would hide the environment overrides documented below.
-  local ENGINES DAEMON RUN_CWD CONFIG CONFIG_TMP SYNC_ALIAS SYNC_CTX
+  local ENGINES DAEMON RUN_CWD CONFIG SYNC_ALIAS SYNC_CTX
   ENGINES="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
   MODELS="${MODELS:-$HOME/dev/models}"
   LLAMA_BIN="${LLAMA_BIN:-$ENGINES/llama.cpp/build/bin/llama-server}"
@@ -90,6 +182,12 @@ Environment overrides:
   DRY_RUN=1          Print the full launch command (plus the generated config for
                      qwen / deepseek / deepseek-maya) and exit (no server, no opencode sync, nothing
                      written to LOG_DIR)
+  GPU_WAIT_S=N       Seconds to wait for another of our servers to release GPU
+                     memory before refusing to start (default: 60). Counts any
+                     process with those executable names, whichever user runs
+                     it, holding memory on any GPU in the machine (not only the
+                     one the new server will use).
+  ALLOW_SHARED_GPU=1 Start even if another of our servers still holds GPU memory
 EOF
   }
 
@@ -375,11 +473,99 @@ EOF
     deepseek-basalt) PROFILE="deepseek" ;;
   esac
 
+  # Validate the profile name before the port check and the GPU wait, so a typo
+  # fails instantly, not after GPU_WAIT_S. Keep this list in sync with the
+  # profile case below.
+  case "$PROFILE" in
+    qwen|deepseek|deepseek-maya|qwen-llama|deepseek-llama) ;;
+    *)
+      echo "Unknown profile or flag: $PROFILE (try: llm-serve --help)" >&2
+      return 1
+      ;;
+  esac
+
   # DRY_RUN must leave LOG_DIR untouched; engine configs are generated into a
   # temp file and only written to $CONFIG after the port check below passes.
   [[ "${DRY_RUN:-0}" == 1 ]] || mkdir -p "$LOG_DIR"
   local -a ARGS=() CMD=()
   RUN_CWD="" CONFIG="" CONFIG_TMP="" SYNC_ALIAS="" SYNC_CTX=""
+
+  # Fail fast on a busy port, before spending up to GPU_WAIT_S waiting for the
+  # GPU: the holder there is often the very server occupying this port.
+  if [[ "${DRY_RUN:-0}" != 1 ]] && ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
+    echo "Something is already listening on port $PORT. Stop it with: llm-serve --stop $PORT" >&2
+    return 1
+  fi
+
+  # Refuse to start while another server still holds GPU memory: the new engine
+  # would come up degraded on the leftovers, and profiles below (deepseek-llama)
+  # size their VRAM caches from a reading taken after the holder is gone.
+  # DRY_RUN stays side-effect free: no wait, no nvidia-smi compute-apps query.
+  local did_wait=0
+  if [[ "${DRY_RUN:-0}" != 1 && "${ALLOW_SHARED_GPU:-0}" != 1 ]]; then
+    local holders holders_rc pid mem name wait_s first_holder deadline_ns poll poll_rc
+    wait_s="${GPU_WAIT_S:-60}"
+    if [[ ! "$wait_s" =~ ^[0-9]{1,6}$ ]]; then
+      echo "llm-serve: GPU_WAIT_S must be a whole number of seconds" >&2
+      return 1
+    fi
+    wait_s=$(( 10#$wait_s ))
+    # A failed first query means we cannot tell: fail open and start as before.
+    # A missing nvidia-smi (rc 3) is the usual headless-free laptop case: stay quiet.
+    holders="$(gpu_holders)" && holders_rc=0 || holders_rc=$?
+    if (( holders_rc == 2 )); then
+      echo "llm-serve: could not query nvidia-smi; starting without the GPU check" >&2
+    fi
+    if (( holders_rc == 0 )) && [[ -n "$holders" ]]; then
+      first_holder=1
+      while read -r pid mem name; do
+        if (( first_holder )); then
+          echo "Waiting for GPU memory: pid $pid ($name, $mem MiB) is still running ... (up to $wait_s s; ALLOW_SHARED_GPU=1 starts anyway)"
+          first_holder=0
+        else
+          echo "Waiting for GPU memory: pid $pid ($name, $mem MiB) is still running ..."
+        fi
+      done <<< "$holders"
+      did_wait=1
+      deadline_ns=$(( $(date +%s%N) + wait_s * 1000000000 ))
+      while :; do
+        # A poll's nvidia-smi can block for its timeout plus --kill-after, so cap
+        # this poll's timeout at the whole seconds left before the deadline (min
+        # 1); otherwise a single poll can overshoot GPU_WAIT_S by ~12 s.
+        NVSMI_TIMEOUT_S=$(( (deadline_ns - $(date +%s%N) + 999999999) / 1000000000 ))
+        (( NVSMI_TIMEOUT_S < 1 )) && NVSMI_TIMEOUT_S=1
+        # A failed poll mid-wait keeps the previous holders (still busy).
+        poll="$(gpu_holders)" && poll_rc=0 || poll_rc=$?
+        if (( poll_rc == 0 )); then
+          holders="$poll"
+          if [[ -z "$holders" ]]; then
+            break
+          fi
+        fi
+        if (( $(date +%s%N) >= deadline_ns )); then
+          while read -r pid mem name; do
+            echo "pid $pid ($name, $mem MiB) is still holding GPU memory." >&2
+          done <<< "$holders"
+          while read -r pid mem name; do
+            echo "Stop pid $pid ($name) - llm-serve --stop if it is one of its servers - or set ALLOW_SHARED_GPU=1 to start anyway." >&2
+          done <<< "$holders"
+          return 1
+        fi
+        sleep 0.5
+      done
+    fi
+  fi
+  # Restore the full timeout for later nvidia-smi calls (deepseek-llama sizing).
+  NVSMI_TIMEOUT_S=10
+
+  # The holder can exit just as something else grabs the port: check again.
+  if (( did_wait )); then
+    if ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
+      echo "Something is already listening on port $PORT. Stop it with: llm-serve --stop $PORT" >&2
+      return 1
+    fi
+  fi
+
   case "$PROFILE" in
     qwen-llama)
       # Qwen3.8-Flash-Next UD-Q4_K_XL + MTP Q8_0 draft head, 256k native ctx (set CTX=524288 for YaRN 2x)
@@ -410,7 +596,7 @@ EOF
       local cache="${MOE_CACHE_MIB:-}"
       if [[ -z "$cache" ]]; then
         local free
-        if free="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d '[:space:]')" && [[ "$free" =~ ^[0-9]+$ ]]; then
+        if free="$(nvsmi --query-gpu=memory.free --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d '[:space:]')" && [[ "$free" =~ ^[0-9]+$ ]]; then
           cache=$(( free - VRAM_RESERVE_MIB - DS_NONCACHE_MIB ))
           if (( cache < 8000 )); then
             echo "deepseek-llama: warning: only $free MiB VRAM free; is another model still loaded? (llm-serve --status)" >&2
@@ -585,13 +771,13 @@ EOF
     if [[ -n "$CONFIG_TMP" ]]; then
       echo "# $CONFIG"
       cat "$CONFIG_TMP"
-      rm -f "$CONFIG_TMP"
+      discard_config_tmp
     fi
     return 0
   fi
 
   if ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .; then
-    [[ -z "$CONFIG_TMP" ]] || rm -f "$CONFIG_TMP"
+    discard_config_tmp
     echo "Something is already listening on port $PORT. Stop it with: llm-serve --stop $PORT" >&2
     return 1
   fi
@@ -599,7 +785,7 @@ EOF
   # the port is free: now, and not before, the live config goes into $LOG_DIR
   if [[ -n "$CONFIG_TMP" ]]; then
     cat "$CONFIG_TMP" > "$CONFIG"
-    rm -f "$CONFIG_TMP"
+    discard_config_tmp
   fi
 
   sync_opencode
