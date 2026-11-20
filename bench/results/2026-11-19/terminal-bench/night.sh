@@ -1,10 +1,10 @@
 #!/usr/bin/env zsh
 # Night run: finish Maya (left + 3 reruns), then Basalt (all 20), then restore Qwen.
 # Both engines through llm-serve on :8000: deepseek-maya (Maya) and deepseek (Basalt, the adopted profile).
-# Usage: night.sh HH:MM   (start time today/tonight)
+# Usage: TB_DIR=<dir> night.sh HH:MM   (start time today/tonight)
+# TB_DIR holds tasks.txt (a copy of ../tb-tasks.txt) and summ.py; harbor jobs go to $TB_DIR/jobs.
 set -u
 T=${TB_DIR:?set TB_DIR to a work directory holding tasks.txt and summ.py}
-S=${T:h}
 log() { echo "$(date +%T) $*"; }
 
 start=$(date -d "$1" +%s); now=$(date +%s)
