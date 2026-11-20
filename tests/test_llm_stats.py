@@ -57,6 +57,7 @@ class MayaServer(HTTPServer):
     metrics_status = 200
     metrics_body = None      # when set, /metrics answers this JSON value instead
     prometheus = ""          # body of /metrics/prometheus
+    requests = []            # /metrics "requests": finished requests, newest first
 
 
 class MayaHandler(StubHandler):
@@ -69,7 +70,7 @@ class MayaHandler(StubHandler):
             "/health": {"status": "ok"},
             "/v1/status": {"service": "maya", "model": "deepseek-v4.1-flash"},
             "/v1/models": {"data": [{"id": "deepseek-v4.1-flash"}]},
-            "/metrics": {"engine": ENGINE, "live": self.server.live},
+            "/metrics": {"engine": ENGINE, "live": self.server.live, "requests": self.server.requests},
             "/metrics/prometheus": self.server.prometheus,
             "/slots": [{"id": 0, "n_ctx": 524288, "is_processing": True}],
         }
@@ -557,6 +558,61 @@ class LlmStatsHeaderTest(unittest.TestCase):
         out = self.assert_header_unchanged(LlamaCppHandler, self.GOLDEN["llamacpp"])
         for prefix, golden in self.GOLDEN_RATES["llamacpp"].items():
             self.assertEqual(rate_line(out.stdout, prefix), golden)
+
+
+def slot_line(stdout):
+    return next((l for l in stdout.splitlines() if l.startswith("Slot 0")), "")
+
+
+class LlmStatsMayaCtxTest(unittest.TestCase):
+    """Maya's used context on the slot line, from /metrics (its /slots has no used count)."""
+    serve = LlmStatsMayaTest.serve
+
+    def slot(self, **cfg):
+        out = run_stats(self.serve(**cfg))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return slot_line(out.stdout)
+
+    def test_generating_counts_prompt_plus_generated(self):
+        line = self.slot(live={**LIVE, "prompt_tokens": 1000})
+        self.assertIn("ctx    7905/524288", line)
+        self.assertIn("[", line)   # the bar is drawn
+
+    def test_reading_ignores_previous_generated(self):
+        line = self.slot(live={"state": "reading", "phase": "reading the prompt", "prompt_tokens": 5000,
+                               "generated": 6905})
+        self.assertIn("ctx    5000/524288", line)
+
+    def test_idle_uses_last_request(self):
+        line = self.slot(live={"state": "idle"}, requests=[
+            {"prompt_tokens": 229237, "output_tokens": 1307}, {"prompt_tokens": 10, "output_tokens": 5}])
+        self.assertIn("ctx  230544/524288", line)
+
+    def test_idle_without_requests_shows_dash(self):
+        line = self.slot(live={"state": "idle"})
+        self.assertIn("ctx       -/524288", line)
+        self.assertNotIn("[", line)
+
+    def test_running_without_prompt_tokens_shows_dash(self):
+        self.assertIn("ctx       -/524288", self.slot(live=LIVE))
+
+    def test_bad_values_show_dash(self):
+        for live, reqs in [({**LIVE, "prompt_tokens": True}, []),
+                           ({**LIVE, "prompt_tokens": -3}, []),
+                           ({"state": "idle"}, [{"prompt_tokens": "9", "output_tokens": 1}]),
+                           ({"state": "idle"}, [{"prompt_tokens": 9}]),
+                           ({"state": "idle"}, ["not a dict"])]:
+            with self.subTest(live=live, reqs=reqs):
+                self.assertIn("ctx       -/524288", self.slot(live=live, requests=reqs))
+
+    def test_bad_generated_counts_prompt_only(self):
+        self.assertIn("ctx    1000/524288", self.slot(live={**LIVE, "prompt_tokens": 1000, "generated": -1}))
+
+    def test_non_list_requests_body_renders(self):
+        self.assertIn("ctx       -/524288", self.slot(live={"state": "idle"}, requests={"a": 1}))
+
+    def test_used_clamps_to_context(self):
+        self.assertIn("ctx  524288/524288", self.slot(live={**LIVE, "prompt_tokens": 600000}))
 
 
 if __name__ == "__main__":
