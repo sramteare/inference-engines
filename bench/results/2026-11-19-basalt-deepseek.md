@@ -83,10 +83,55 @@ out, temperature 0. Each engine was started cold, alone on the GPU, and answered
   the same code plus the any-model-name serve patch, from `~/dev/basalt-ds41-serve`.
 - **Raw data:** `2026-11-19/multiturn-basalt.json`, `2026-11-19/multiturn-maya.json`.
 
+## Terminal-Bench 2.0, 20 tasks (`2026-11-19/terminal-bench/`)
+
+harbor 0.26.0, agent `terminus-2`, `-n 1`, `--agent-timeout-multiplier 2`, one attempt per task, through
+`llm-serve -d deepseek` (Basalt) and `llm-serve -d deepseek-maya` (Maya + drafter) on :8000. Tasks:
+`2026-11-19/tb-tasks.txt`.
+
+| | Maya + drafter | **Basalt + drafter** |
+|---|---|---|
+| Passed | **17 / 20** | 16 / 20 |
+| Time, the 12 tasks both ran on a quiet machine | 185 min | **133 min** |
+| Time, all 20 | not comparable (see below) | 2 h 56 min |
+
+| Task | Maya | Basalt |
+|---|---|---|
+| `db-wal-recovery` | timed out (30.4 min) | **passed, 2.6 min** |
+| `query-optimize` | failed, 15.1 min | **passed, 16.4 min** |
+| `polyglot-c-py` | **passed, 10.4 min** | failed, 7.0 min |
+| `polyglot-rust-c` | **passed, 13.0 min** | failed, 3.8 min |
+| `torch-pipeline-parallelism` | **passed** (agent hit its time limit, 33.1 min; the grader passed what it left) | failed, 21.8 min |
+| `path-tracing-reverse` | timed out (60.6 min) | timed out (60.5 min) |
+| the other 14 | passed | passed |
+
+- **Maya's 20 come from two runs.** 12 tasks ran overnight on a quiet machine (`tb20-maya-b`), including reruns of
+  `db-wal-recovery`, `path-tracing-reverse` and `torch-pipeline-parallelism`, whose first try shared the server.
+  The other 8 come from the first pass (`tb20-maya`), which shared the server with other work. All 8 passed, so the pass
+  counts stand, but their times are not comparable.
+- **Both Basalt polyglot failures were cleanup, not wrong code.** The agent left compiled binaries next to the source,
+  and the grader requires the source to be the only file in the directory.
+- **No reasoning loops in any of the 43 trials.** In every reasoning trace of 2,000+ words, at most 15.5% of the 12-word phrases repeat,
+  against the 90% that marks a loop below.
+- **One attempt per task.** A one- or two-task gap is noise. What this shows: Basalt serves our UD-Q2_K_XL file through a
+  real agent loop with the same pass rate as Maya, and finishes faster.
+- **Raw data:** `results.csv` (one row per trial), `night.sh` (the run), `summ.py`.
+
+## Reasoning loops on long reviews
+
+Two long code-review prompts (6.9k and 18.4k tokens, `max_tokens` 64000, temperature 0.6) came back empty from Basalt:
+the model was still thinking at 64,000 tokens. Reruns found loops where 90% or more of the last 2,000 words' 12-word
+phrases had already appeared.
+
+- **Basalt, the 18.4k prompt, top_p 0.95, 4 runs each way:** drafter on, 3 answered and 1 looped; drafter off
+  (`spec 0`), 3 answered and 1 looped. **The drafter is not the cause.** Drafter on generated about 128 t/s against
+  72 t/s off.
+- **Maya:** one run of each prompt, both answered (0.6% and 3.9% repeats). Maya's loop rate is not measured, so this
+  does not show Basalt loops more often.
+
 ## Not done yet
 
-- **Terminal-Bench:** 20 tasks are picked (`2026-11-19/tb-tasks.txt`). Maya's first pass is partial and some of its
-  tasks shared the server with other work, so the Maya vs Basalt comparison is postponed to a quiet machine.
+- **Maya loop rate:** 4 runs of the 18.4k prompt, to compare with Basalt's 1 in 4.
 - **Upstream:** the Basalt changes are proposed as [jesdga95/basalt#481](https://github.com/jesdga95/basalt/pull/481),
   rebased onto Basalt 0.5.0, with an independent review, parity tests and the KLD gate. The any-model-name serve patch
   was dropped: jesdga95/basalt#337 covers it.
