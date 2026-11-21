@@ -1,4 +1,5 @@
 """llm-serve refuses to launch while another server still holds GPU memory."""
+import json
 import os
 import select
 import shutil
@@ -745,6 +746,114 @@ class LlmServeGpuWaitTest(unittest.TestCase):
             self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
             self.assertIn(f"Unknown profile or flag: {bad}", out.stderr)
             self.assertNotIn(WAIT_MSG, out.stdout + out.stderr)
+
+    def dry_run_config(self, profile, **env):
+        # DRY_RUN prints the launch command, then "# <config path>" and the config.
+        out = self.run_serve(free_port(), profile=profile, DRY_RUN="1", **env)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        _, sep, config = out.stdout.partition("\n# ")
+        self.assertTrue(sep, out.stdout)
+        return json.loads(config.split("\n", 1)[1])
+
+    def test_qwen_vision(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        cfg = self.dry_run_config("qwen")
+        self.assertEqual(cfg["engine"]["vision"], "dynamic")
+        self.assertNotIn("vision", cfg["server"])
+        for value, want in (("cpu", "cpu"), ("off", "off"), ("1", 1), ("dynamic", "dynamic")):
+            engine = self.dry_run_config("qwen", VISION=value)["engine"]
+            self.assertEqual(engine["vision"], want, value)
+            self.assertIs(type(engine["vision"]), type(want), value)
+
+    def test_invalid_vision_refuses_before_starting(self):
+        basalt_dir = self.tmp / "basalt-dir"
+        (basalt_dir / "bin").mkdir(parents=True)
+        basalt = basalt_dir / "bin" / "basalt"
+        basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        basalt.chmod(0o755)
+        self.write_holders()
+        for bad in ("gpu", "-1", "1.5", "GPU0"):
+            for dry in ("0", "1"):
+                out = self.run_serve(free_port(), profile="qwen", VISION=bad,
+                                     BASALT_DIR=str(basalt_dir), DRY_RUN=dry)
+                self.assertEqual(out.returncode, 1, f"{bad!r}: {out.stdout}{out.stderr}")
+                self.assertIn("VISION must be", out.stderr)
+                self.assertNotIn(MARKER, out.stdout)
+                self.assertNotIn(str(basalt), out.stdout)
+        self.assertFalse(self.logs.exists())
+
+    def test_deepseek_basalt_has_no_vision(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        ds_dir = self.tmp / "basalt-ds-dir"
+        (ds_dir / "bin").mkdir(parents=True)
+        ds_basalt = ds_dir / "bin" / "basalt"
+        ds_basalt.write_text("#!/bin/sh\nexit 0\n")
+        ds_basalt.chmod(0o755)
+        ds_python = self.tmp / "basalt-ds-python"
+        ds_python.write_text("#!/bin/sh\nexit 0\n")
+        ds_python.chmod(0o755)
+        env = {"BASALT_DS_DIR": str(ds_dir), "BASALT_DS_PYTHON": str(ds_python)}
+        # deepseek (Basalt) ignores VISION, even an invalid one
+        for vision in (None, "cpu", "gpu"):
+            extra = dict(env) if vision is None else dict(env, VISION=vision)
+            ds = self.dry_run_config("deepseek", **extra)
+            self.assertNotIn("vision", ds["server"])
+            self.assertNotIn("vision", ds["engine"])
+
+    def maya_dir_with(self, template):
+        maya_dir = self.tmp / "maya-dir"
+        maya_dir.mkdir(exist_ok=True)
+        (maya_dir / "maya-ds4.json").write_text(json.dumps(template) + "\n")
+        return str(maya_dir)
+
+    def test_deepseek_maya_vision(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        template = {"args": ["--max-context", "131072", "--vision", "off",
+                             "--reserve-mib", "4096", "--ablate", "refusal.gguf",
+                             "--ablate-default", "0.5"],
+                    "ablate": {"refusal": 1}, "sampling": {"ablate": 2}}
+        maya_dir = self.maya_dir_with(template)
+        for vision, want in ((None, "on"), ("on", "on"), ("dynamic", "on"), ("off", "off")):
+            extra = {"MAYA_DIR": maya_dir, "CTX": "65536"}
+            if vision is not None:
+                extra["VISION"] = vision
+            cfg = self.dry_run_config("deepseek-maya", **extra)
+            args = cfg["args"]
+            self.assertEqual(args.count("--vision"), 1, args)
+            self.assertEqual(args[args.index("--vision") + 1], want, vision)
+            # ablation still stripped, ctx/reserve still replaced
+            self.assertEqual(args, ["--max-context", "65536", "--vision", want,
+                                    "--reserve-mib", "3072"])
+            self.assertNotIn("ablate", cfg)
+            self.assertNotIn("ablate", cfg["sampling"])
+        # a template without --vision gets it appended
+        maya_dir = self.maya_dir_with({"args": ["--max-context", "131072"]})
+        for vision, want in ((None, "on"), ("off", "off")):
+            extra = {"MAYA_DIR": maya_dir}
+            if vision is not None:
+                extra["VISION"] = vision
+            args = self.dry_run_config("deepseek-maya", **extra)["args"]
+            self.assertEqual(args, ["--max-context", "524288", "--vision", want])
+
+    def test_deepseek_maya_invalid_vision_refuses_before_starting(self):
+        maya_dir = self.maya_dir_with({"args": ["--vision", "off"]})
+        self.write_holders()
+        for bad in ("cpu", "1", "gpu"):
+            for dry in ("0", "1"):
+                out = self.run_serve(free_port(), profile="deepseek-maya", VISION=bad,
+                                     MAYA_DIR=maya_dir, DRY_RUN=dry)
+                self.assertEqual(out.returncode, 1, f"{bad!r}: {out.stdout}{out.stderr}")
+                self.assertIn("deepseek-maya: VISION must be on, dynamic or off", out.stderr)
+                self.assertNotIn("maya.py", out.stdout)
+        self.assertFalse(self.logs.exists())
+
+    def test_qwen_rejects_on(self):
+        out = self.run_serve(free_port(), profile="qwen", VISION="on", DRY_RUN="1")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("VISION must be off, dynamic, cpu or a GPU number", out.stderr)
 
 
 if __name__ == "__main__":
