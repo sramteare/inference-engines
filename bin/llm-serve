@@ -166,8 +166,10 @@ Flags / Subcommands:
 Environment overrides:
   SPEC=1|0           Enable (1, default) or disable (0) speculative decoding (MTP / DSpark)
   CTX=N              Override context window size (default: 262144 qwen, 524288 deepseek / deepseek-maya)
-  VISION=MODE        Image input. qwen and deepseek: dynamic (default; encoder in pinned RAM, on the
-                     GPU only for requests with pictures, no VRAM at rest), cpu, off, or a GPU number.
+  VISION=MODE        Image input. qwen: dynamic (default; encoder in pinned RAM, on the GPU only for
+                     requests with pictures, no VRAM at rest), cpu, off, or a GPU number.
+                     deepseek: dynamic (default; the encoder runs on the GPU for requests with pictures,
+                     at the cost of about one expert per layer of GPU cache), cpu, off or a GPU number.
                      deepseek-maya: on / dynamic (default, both mean on) or off. Other profiles ignore it.
   PORT=N             Server port (default: 8000)
   HOST=ADDR          Bind address (default: 0.0.0.0; 127.0.0.1 for qwen, deepseek and deepseek-maya, the Basalt/Maya profiles)
