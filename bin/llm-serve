@@ -147,7 +147,7 @@ Usage:
 
 Profiles:
   qwen            Qwen UD-Q4_K_XL on Basalt: faster, closer to BF16, image input (default)
-  deepseek        DeepSeek UD-Q2_K_XL on Basalt: same quality as Maya, ~37% faster generation, reuses multi-turn prompts
+  deepseek        DeepSeek UD-Q2_K_XL on Basalt: same quality as Maya, ~37% faster generation, reuses multi-turn prompts, image input
   deepseek-maya   DeepSeek UD-Q2_K_XL on Project Maya: faster to the first token of a long new prompt, image input
   qwen-llama      Qwen UD-Q4_K_XL + MTP Q8_0, 256k ctx, f16 KV, -fitt (llama.cpp fallback)
   deepseek-llama  DeepSeek UD-Q2_K_XL + DSpark Q8_0, 512k ctx, GPU expert cache + CPU share (llama.cpp fallback)
@@ -166,8 +166,8 @@ Flags / Subcommands:
 Environment overrides:
   SPEC=1|0           Enable (1, default) or disable (0) speculative decoding (MTP / DSpark)
   CTX=N              Override context window size (default: 262144 qwen, 524288 deepseek / deepseek-maya)
-  VISION=MODE        Image input. qwen: dynamic (default; encoder in pinned RAM, on the GPU only for
-                     requests with pictures, no VRAM at rest), cpu, off, or a GPU number.
+  VISION=MODE        Image input. qwen and deepseek: dynamic (default; encoder in pinned RAM, on the
+                     GPU only for requests with pictures, no VRAM at rest), cpu, off, or a GPU number.
                      deepseek-maya: on / dynamic (default, both mean on) or off. Other profiles ignore it.
   PORT=N             Server port (default: 8000)
   HOST=ADDR          Bind address (default: 0.0.0.0; 127.0.0.1 for qwen, deepseek and deepseek-maya, the Basalt/Maya profiles)
@@ -447,7 +447,7 @@ EOF
     --list|list)
       echo "Profiles:"
       echo "  qwen            Qwen UD-Q4_K_XL on Basalt: faster, closer to BF16, image input (default)"
-      echo "  deepseek        DeepSeek UD-Q2_K_XL on Basalt: same quality as Maya, ~37% faster generation, reuses multi-turn prompts"
+      echo "  deepseek        DeepSeek UD-Q2_K_XL on Basalt: same quality as Maya, ~37% faster generation, reuses multi-turn prompts, image input"
       echo "  deepseek-maya   DeepSeek UD-Q2_K_XL on Project Maya: faster to the first token of a long new prompt, image input"
       echo "  qwen-llama      Qwen UD-Q4_K_XL + MTP Q8_0, 256k ctx, f16 KV, -fitt (llama.cpp fallback)"
       echo "  deepseek-llama  DeepSeek UD-Q2_K_XL + DSpark Q8_0, 512k ctx, GPU expert cache + CPU share (llama.cpp fallback)"
@@ -487,10 +487,14 @@ EOF
       return 1
       ;;
   esac
-  # Only qwen and deepseek-maya read VISION; check it here so a typo also fails
-  # before the GPU wait. Maya's --vision is a plain on/off switch.
+  # Only qwen, deepseek and deepseek-maya read VISION; check it here so a typo
+  # also fails before the GPU wait. Maya's --vision is a plain on/off switch.
   if [[ "$PROFILE" == qwen && ! "$VISION" =~ ^(off|dynamic|cpu|[0-9]+)$ ]]; then
     echo "llm-serve: VISION must be off, dynamic, cpu or a GPU number (got: $VISION)" >&2
+    return 1
+  fi
+  if [[ "$PROFILE" == deepseek && ! "$VISION" =~ ^(off|dynamic|cpu|[0-9]+)$ ]]; then
+    echo "llm-serve: deepseek: VISION must be off, dynamic, cpu or a GPU number (got: $VISION)" >&2
     return 1
   fi
   if [[ "$PROFILE" == deepseek-maya && ! "$VISION" =~ ^(on|dynamic|off)$ ]]; then
@@ -641,6 +645,7 @@ EOF
       # +700 on the reserve: vram-reserve-mib doubles as Basalt's own scratch reserve.
       # Runs from BASALT_DS_DIR (MXFP4/IQ3_S expert support ~/dev/basalt-src lacks),
       # server started with --python BASALT_DS_PYTHON (BASALT_DS_DIR has no .venv).
+      # vision is the image encoder, dynamic by default.
       local ctx="${CTX:-524288}"
       [[ -n "$HOST_SET" ]] || HOST="127.0.0.1"
       CONFIG="$LOG_DIR/basalt-deepseek.json"
@@ -654,15 +659,17 @@ EOF
       fi
       CONFIG_TMP="$(mktemp)"
       jq -n \
-        --arg model "$MODELS/deepseek-v41-1017/basalt/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL.basalt" \
+        --arg model "$MODELS/deepseek-v41-1017/basalt/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL.vision.basalt" \
         --arg host "$HOST" \
         --argjson ctx "$ctx" \
         --argjson port "$PORT" \
         --argjson rsv "$(( VRAM_RESERVE_MIB + 700 ))" \
         --argjson spec "$SPEC" \
+        --arg vision "$VISION" \
         '{version: 2,
           models: [{alias: "deepseek-v4.1-flash", model: $model, gpu: "0"}],
-          engine: ({"max-context": $ctx, "vram-reserve-mib": $rsv, "answer-room": 0}
+          engine: ({"max-context": $ctx, "vram-reserve-mib": $rsv, "answer-room": 0,
+                    vision: (if ($vision | test("^[0-9]+$")) then ($vision | tonumber) else $vision end)}
                    + (if $spec == 0 then {spec: 0} else {} end)),
           server: {host: $host, port: $port}}' > "$CONFIG_TMP"
       RUN_CWD="$BASALT_DS_DIR"

@@ -783,7 +783,7 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                 self.assertNotIn(str(basalt), out.stdout)
         self.assertFalse(self.logs.exists())
 
-    def test_deepseek_basalt_has_no_vision(self):
+    def test_deepseek_basalt_vision(self):
         if shutil.which("jq") is None:
             self.skipTest("jq not found on this machine")
         ds_dir = self.tmp / "basalt-ds-dir"
@@ -795,12 +795,32 @@ class LlmServeGpuWaitTest(unittest.TestCase):
         ds_python.write_text("#!/bin/sh\nexit 0\n")
         ds_python.chmod(0o755)
         env = {"BASALT_DS_DIR": str(ds_dir), "BASALT_DS_PYTHON": str(ds_python)}
-        # deepseek (Basalt) ignores VISION, even an invalid one
-        for vision in (None, "cpu", "gpu"):
-            extra = dict(env) if vision is None else dict(env, VISION=vision)
-            ds = self.dry_run_config("deepseek", **extra)
-            self.assertNotIn("vision", ds["server"])
-            self.assertNotIn("vision", ds["engine"])
+        cfg = self.dry_run_config("deepseek", **env)
+        self.assertEqual(cfg["engine"]["vision"], "dynamic")
+        self.assertNotIn("vision", cfg["server"])
+        self.assertTrue(cfg["models"][0]["model"].endswith("UD-Q2_K_XL.vision.basalt"),
+                        cfg["models"][0]["model"])
+        for value, want in (("cpu", "cpu"), ("off", "off"), ("1", 1), ("dynamic", "dynamic")):
+            engine = self.dry_run_config("deepseek", VISION=value, **env)["engine"]
+            self.assertEqual(engine["vision"], want, value)
+            self.assertIs(type(engine["vision"]), type(want), value)
+
+    def test_deepseek_basalt_invalid_vision_refuses_before_starting(self):
+        ds_dir = self.tmp / "basalt-ds-dir"
+        (ds_dir / "bin").mkdir(parents=True)
+        ds_basalt = ds_dir / "bin" / "basalt"
+        ds_basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        ds_basalt.chmod(0o755)
+        self.write_holders()
+        for bad in ("gpu", "-1", "1.5", "GPU0", "on"):
+            for dry in ("0", "1"):
+                out = self.run_serve(free_port(), profile="deepseek", VISION=bad,
+                                     BASALT_DS_DIR=str(ds_dir), DRY_RUN=dry)
+                self.assertEqual(out.returncode, 1, f"{bad!r}: {out.stdout}{out.stderr}")
+                self.assertIn("deepseek: VISION must be", out.stderr)
+                self.assertNotIn(MARKER, out.stdout)
+                self.assertNotIn(str(ds_basalt), out.stdout)
+        self.assertFalse(self.logs.exists())
 
     def maya_dir_with(self, template):
         maya_dir = self.tmp / "maya-dir"
