@@ -126,6 +126,11 @@ main() {
   PORT="${PORT:-8000}"
   SPEC="${SPEC:-1}"
   VISION="${VISION:-dynamic}"
+  # ${VAR-default} (no colon): an explicitly set empty value stays empty and is
+  # refused by the validation below instead of silently becoming the default.
+  CONV_CACHE_MIB="${CONV_CACHE_MIB-16384}"
+  CONV_CACHE_MIN_TOKENS="${CONV_CACHE_MIN_TOKENS-32768}"
+  CONV_CACHE_DISK_MIB="${CONV_CACHE_DISK_MIB-65536}"
   VRAM_RESERVE_MIB="${VRAM_RESERVE_MIB:-3072}"
   DS_NONCACHE_MIB="${DS_NONCACHE_MIB:-23000}"
   MOE_CPU_SHARE="${MOE_CPU_SHARE:-0.85}"
@@ -171,6 +176,13 @@ Environment overrides:
                      deepseek: dynamic (default; the encoder runs on the GPU for requests with pictures,
                      at the cost of about one expert per layer of GPU cache), cpu, off or a GPU number.
                      deepseek-maya: on / dynamic (default, both mean on) or off. Other profiles ignore it.
+  CONV_CACHE_MIB=N   qwen: Basalt conversation cache RAM budget, MiB; parked conversations are kept in
+                     host RAM, not VRAM; 0 turns the RAM tier off (default: 16384)
+  CONV_CACHE_MIN_TOKENS=N
+                     qwen: park only conversations at least this many tokens (default: 32768)
+  CONV_CACHE_DISK_MIB=N
+                     qwen: conversation cache disk budget, MiB; the disk tier spills to host disk, not
+                     VRAM; 0 turns the disk tier off (default: 65536)
   PORT=N             Server port (default: 8000)
   HOST=ADDR          Bind address (default: 0.0.0.0; 127.0.0.1 for qwen, deepseek and deepseek-maya, the Basalt/Maya profiles)
   MODELS=DIR         Models root directory (default: ~/dev/models)
@@ -503,6 +515,21 @@ EOF
     echo "llm-serve: deepseek-maya: VISION must be on, dynamic or off (got: $VISION)" >&2
     return 1
   fi
+  # Only qwen reads the Basalt conversation cache knobs; validate them like VISION,
+  # before the GPU wait and any start, so a typo fails fast (also under DRY_RUN).
+  # No leading zeros: jq --argjson would reject "0123" as invalid JSON later.
+  if [[ "$PROFILE" == qwen && ! "$CONV_CACHE_MIB" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "llm-serve: CONV_CACHE_MIB must be a non-negative integer (got: $CONV_CACHE_MIB)" >&2
+    return 1
+  fi
+  if [[ "$PROFILE" == qwen && ! "$CONV_CACHE_MIN_TOKENS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "llm-serve: CONV_CACHE_MIN_TOKENS must be a non-negative integer (got: $CONV_CACHE_MIN_TOKENS)" >&2
+    return 1
+  fi
+  if [[ "$PROFILE" == qwen && ! "$CONV_CACHE_DISK_MIB" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "llm-serve: CONV_CACHE_DISK_MIB must be a non-negative integer (got: $CONV_CACHE_DISK_MIB)" >&2
+    return 1
+  fi
 
   # DRY_RUN must leave LOG_DIR untouched; engine configs are generated into a
   # temp file and only written to $CONFIG after the port check below passes.
@@ -735,12 +762,18 @@ EOF
         --argjson rsv "$(( VRAM_RESERVE_MIB + 700 ))" \
         --argjson spec "$SPEC" \
         --arg vision "$VISION" \
+        --argjson cc_mib "$CONV_CACHE_MIB" \
+        --argjson cc_min_tokens "$CONV_CACHE_MIN_TOKENS" \
+        --argjson cc_disk_mib "$CONV_CACHE_DISK_MIB" \
         '{version: 2,
           models: [{alias: "qwen3.8-flash-next", model: $model, gpu: "0", kv: "fp16"}],
           engine: ({"max-context": $ctx, "vram-reserve-mib": $rsv,
                     "resident-experts": true, "answer-room": 0,
                     vision: (if ($vision | test("^[0-9]+$")) then ($vision | tonumber) else $vision end)}
-                   + (if $spec == 0 then {spec: 0} else {} end)),
+                   + (if $spec == 0 then {spec: 0} else {} end)
+                   + (if $cc_mib > 0 then {"conversation-cache-mib": $cc_mib,
+                                           "conversation-cache-min-tokens": $cc_min_tokens} else {} end)
+                   + (if $cc_disk_mib > 0 then {"conversation-cache-disk-mib": $cc_disk_mib} else {} end)),
           server: {host: $host, port: $port}}' > "$CONFIG_TMP"
       RUN_CWD="$BASALT_DIR"
       CMD=("$BASALT_DIR/bin/basalt" serve --config "$CONFIG" "$@")
