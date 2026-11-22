@@ -792,15 +792,22 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                           ("conversation-cache-disk-mib", 65536)):
             self.assertEqual(engine[key], want, key)
             self.assertIs(type(engine[key]), int, key)
-        # RAM tier off: both RAM keys go, the disk tier keeps its own key.
-        engine = self.dry_run_config("qwen", CONV_CACHE_MIB="0")["engine"]
+        # RAM tier off: its key goes, but min-tokens stays while the disk tier is on.
+        engine = self.dry_run_config("qwen", CONV_CACHE_MIB="0", CONV_CACHE_DISK_MIB="65536",
+                                     CONV_CACHE_MIN_TOKENS="65536")["engine"]
         self.assertNotIn("conversation-cache-mib", engine)
-        self.assertNotIn("conversation-cache-min-tokens", engine)
         self.assertEqual(engine["conversation-cache-disk-mib"], 65536)
+        self.assertEqual(engine["conversation-cache-min-tokens"], 65536)
         engine = self.dry_run_config("qwen", CONV_CACHE_DISK_MIB="0")["engine"]
         self.assertNotIn("conversation-cache-disk-mib", engine)
         self.assertEqual(engine["conversation-cache-mib"], 16384)
         self.assertEqual(engine["conversation-cache-min-tokens"], 32768)
+        # Both tiers off: no key at all, whatever min-tokens says.
+        engine = self.dry_run_config("qwen", CONV_CACHE_MIB="0", CONV_CACHE_DISK_MIB="0",
+                                     CONV_CACHE_MIN_TOKENS="65536")["engine"]
+        for key in ("conversation-cache-mib", "conversation-cache-min-tokens",
+                    "conversation-cache-disk-mib"):
+            self.assertNotIn(key, engine)
         engine = self.dry_run_config("qwen", CONV_CACHE_MIB="2048",
                                      CONV_CACHE_MIN_TOKENS="4096",
                                      CONV_CACHE_DISK_MIB="131072")["engine"]
@@ -819,13 +826,14 @@ class LlmServeGpuWaitTest(unittest.TestCase):
         self.write_holders()
         for name in ("CONV_CACHE_MIB", "CONV_CACHE_MIN_TOKENS", "CONV_CACHE_DISK_MIB"):
             # "" stays refused (the vars read ${VAR-default}, so only an unset
-            # one falls back) and "012" too: jq --argjson would reject it.
-            for bad in ("-1", "1.5", "abc", "", "012"):
+            # one falls back), "012" has a leading zero and "1000000000" is
+            # more than 9 digits.
+            for bad in ("-1", "1.5", "abc", "", "012", "1000000000"):
                 for dry in ("0", "1"):
                     out = self.run_serve(free_port(), profile="qwen", BASALT_DIR=str(basalt_dir),
                                          DRY_RUN=dry, **{name: bad})
                     self.assertEqual(out.returncode, 1, f"{name}={bad!r}: {out.stdout}{out.stderr}")
-                    self.assertIn(f"{name} must be a non-negative integer (got: {bad})", out.stderr)
+                    self.assertIn(f"{name} must be a non-negative integer of at most 9 digits (got: {bad})", out.stderr)
                     self.assertNotIn(MARKER, out.stdout)
                     self.assertNotIn(str(basalt), out.stdout)
         self.assertFalse(self.logs.exists())
@@ -846,6 +854,12 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                "CONV_CACHE_MIB": "1024", "CONV_CACHE_MIN_TOKENS": "512",
                "CONV_CACHE_DISK_MIB": "2048"}
         engine = self.dry_run_config("deepseek", **env)["engine"]
+        for key in ("conversation-cache-mib", "conversation-cache-min-tokens",
+                    "conversation-cache-disk-mib"):
+            self.assertNotIn(key, engine)
+        # And a bogus value refuses on qwen only: deepseek starts (dry_run_config
+        # asserts returncode 0) with no cache keys.
+        engine = self.dry_run_config("deepseek", **dict(env, CONV_CACHE_MIB="abc"))["engine"]
         for key in ("conversation-cache-mib", "conversation-cache-min-tokens",
                     "conversation-cache-disk-mib"):
             self.assertNotIn(key, engine)
