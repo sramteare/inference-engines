@@ -793,6 +793,10 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                           ("conversation-cache-disk-mib", 65536)):
             self.assertEqual(engine[key], want, key)
             self.assertIs(type(engine[key]), int, key)
+        # The qwen-basalt alias is qwen: same defaults.
+        engine = self.dry_run_config("qwen-basalt")["engine"]
+        self.assertEqual(engine["conversation-cache-mib"], 16384)
+        self.assertEqual(engine["conversation-cache-slots"], 4)
         # RAM tier off: its key goes, but min-tokens stays while the disk tier is on.
         engine = self.dry_run_config("qwen", CONV_CACHE_MIB="0", CONV_CACHE_DISK_MIB="65536",
                                      CONV_CACHE_MIN_TOKENS="65536")["engine"]
@@ -881,6 +885,22 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                           ("conversation-cache-disk-mib", 2048)):
             self.assertEqual(engine[key], want, key)
             self.assertIs(type(engine[key]), int, key)
+        # Only one knob set: it wins, the other three still take deepseek defaults.
+        engine = self.dry_run_config("deepseek", CONV_CACHE_MIB="4096", **env)["engine"]
+        for key, want in (("conversation-cache-mib", 4096),
+                          ("conversation-cache-slots", 16),
+                          ("conversation-cache-min-tokens", 8192),
+                          ("conversation-cache-disk-mib", 16384)):
+            self.assertEqual(engine[key], want, key)
+        # The deepseek-basalt alias is deepseek: same defaults.
+        engine = self.dry_run_config("deepseek-basalt", **env)["engine"]
+        self.assertEqual(engine["conversation-cache-mib"], 2048)
+        self.assertEqual(engine["conversation-cache-slots"], 16)
+        # 0 slots is accepted once the RAM tier is off: the launcher skips that rule.
+        engine = self.dry_run_config("deepseek", CONV_CACHE_MIB="0", CONV_CACHE_SLOTS="0",
+                                     **env)["engine"]
+        self.assertNotIn("conversation-cache-mib", engine)
+        self.assertNotIn("conversation-cache-slots", engine)
         # RAM tier off: its key goes, min-tokens stays while the disk tier is on.
         engine = self.dry_run_config("deepseek", CONV_CACHE_MIB="0", **env)["engine"]
         self.assertNotIn("conversation-cache-mib", engine)
@@ -895,20 +915,34 @@ class LlmServeGpuWaitTest(unittest.TestCase):
             self.assertNotIn(key, engine)
         # Deepseek validates the knobs too, before Basalt starts.
         self.write_holders()
-        for var, bad, msg in (("CONV_CACHE_MIB", "abc",
-                               "CONV_CACHE_MIB must be a non-negative integer of at most "
-                               "9 digits (got: abc)"),
-                              ("CONV_CACHE_SLOTS", "0",
-                               "CONV_CACHE_SLOTS must be at least 1 (got: 0)")):
-            for dry in ("0", "1"):
-                out = self.run_serve(free_port(), profile="deepseek", **{var: bad},
-                                     BASALT_DS_DIR=str(ds_dir), BASALT_DS_PYTHON=str(ds_python),
-                                     DRY_RUN=dry)
-                self.assertEqual(out.returncode, 1, f"{var}={bad} {out.stdout}{out.stderr}")
-                self.assertIn(msg, out.stderr)
-                self.assertNotIn(MARKER, out.stdout)
-                self.assertNotIn(str(ds_basalt), out.stdout)
+        for name in ("CONV_CACHE_MIB", "CONV_CACHE_MIN_TOKENS", "CONV_CACHE_DISK_MIB",
+                     "CONV_CACHE_SLOTS"):
+            for bad in ("-1", "1.5", "abc", "", "012", "1000000000"):
+                for dry in ("0", "1"):
+                    out = self.run_serve(free_port(), profile="deepseek",
+                                         BASALT_DS_DIR=str(ds_dir),
+                                         BASALT_DS_PYTHON=str(ds_python),
+                                         DRY_RUN=dry, **{name: bad})
+                    self.assertEqual(out.returncode, 1, f"{name}={bad!r}: {out.stdout}{out.stderr}")
+                    self.assertIn(f"{name} must be a non-negative integer of at most 9 digits "
+                                  f"(got: {bad})", out.stderr)
+                    self.assertNotIn(MARKER, out.stdout)
+                    self.assertNotIn(str(ds_basalt), out.stdout)
+        # And 0 slots refuses while the RAM tier is on, with its own message.
+        for dry in ("0", "1"):
+            out = self.run_serve(free_port(), profile="deepseek", CONV_CACHE_SLOTS="0",
+                                 BASALT_DS_DIR=str(ds_dir), BASALT_DS_PYTHON=str(ds_python),
+                                 DRY_RUN=dry)
+            self.assertEqual(out.returncode, 1, f"dry={dry}: {out.stdout}{out.stderr}")
+            self.assertIn("CONV_CACHE_SLOTS must be at least 1 (got: 0)", out.stderr)
+            self.assertNotIn(MARKER, out.stdout)
+            self.assertNotIn(str(ds_basalt), out.stdout)
         self.assertFalse(self.logs.exists())
+
+    def test_qwen_llama_ignores_conversation_cache(self):
+        out = self.run_serve(free_port(), profile="qwen-llama", DRY_RUN="1", CONV_CACHE_MIB="abc")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("conversation-cache", out.stdout)
 
     def test_deepseek_maya_ignores_conversation_cache(self):
         if shutil.which("jq") is None:

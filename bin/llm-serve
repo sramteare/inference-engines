@@ -180,8 +180,9 @@ Environment overrides:
   CONV_CACHE_MIB=N   qwen and deepseek: Basalt conversation cache RAM budget, MiB; parked conversations
                      are kept in host RAM, not VRAM; 0 turns the RAM tier off
                      (default: 16384 for qwen, 2048 for deepseek)
-  CONV_CACHE_SLOTS=N qwen and deepseek: most conversations kept in the RAM tier (the disk tier is
-                     limited only by its budget) (default: 4 for qwen, 16 for deepseek)
+  CONV_CACHE_SLOTS=N qwen and deepseek: most conversations kept in the RAM tier, at least 1; ignored
+                     when CONV_CACHE_MIB=0; the disk tier is limited only by its budget
+                     (default: 4 for qwen, 16 for deepseek)
   CONV_CACHE_MIN_TOKENS=N
                      qwen and deepseek: park only conversations at least this many tokens, on both the
                      RAM and the disk tier (default: 32768 for qwen, 8192 for deepseek)
@@ -189,6 +190,8 @@ Environment overrides:
                      qwen and deepseek: conversation cache disk budget, MiB; the disk tier spills to
                      host disk, not VRAM, and also keeps conversations across server restarts;
                      0 turns the disk tier off (default: 65536 for qwen, 16384 for deepseek)
+                     The CONV_CACHE_* names are shared: a value exported for qwen also applies
+                     to deepseek.
   PORT=N             Server port (default: 8000)
   HOST=ADDR          Bind address (default: 0.0.0.0; 127.0.0.1 for qwen, deepseek and deepseek-maya, the Basalt/Maya profiles)
   MODELS=DIR         Models root directory (default: ~/dev/models)
@@ -557,9 +560,10 @@ EOF
     echo "llm-serve: CONV_CACHE_SLOTS must be a non-negative integer of at most 9 digits (got: $CONV_CACHE_SLOTS)" >&2
     return 1
   fi
-  # 0 slots leaves Basalt with a RAM tier it refuses to build: use CONV_CACHE_MIB=0
-  # to turn the RAM tier off instead.
-  if [[ ( "$PROFILE" == qwen || "$PROFILE" == deepseek ) && "$CONV_CACHE_SLOTS" == 0 ]]; then
+  # Launcher rule: 0 slots would silently turn the RAM tier off (Basalt only warns on qwen);
+  # use CONV_CACHE_MIB=0 for that. Skipped when the RAM tier is off anyway.
+  if [[ ( "$PROFILE" == qwen || "$PROFILE" == deepseek ) && "$CONV_CACHE_MIB" != 0
+         && "$CONV_CACHE_SLOTS" == 0 ]]; then
     echo "llm-serve: CONV_CACHE_SLOTS must be at least 1 (got: $CONV_CACHE_SLOTS)" >&2
     return 1
   fi
