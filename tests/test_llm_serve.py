@@ -804,6 +804,10 @@ class LlmServeGpuWaitTest(unittest.TestCase):
         self.assertNotIn("conversation-cache-slots", engine)
         self.assertEqual(engine["conversation-cache-disk-mib"], 65536)
         self.assertEqual(engine["conversation-cache-min-tokens"], 65536)
+        # 0 slots is accepted once the RAM tier is off: the launcher skips that rule.
+        engine = self.dry_run_config("qwen", CONV_CACHE_MIB="0", CONV_CACHE_SLOTS="0")["engine"]
+        self.assertNotIn("conversation-cache-mib", engine)
+        self.assertNotIn("conversation-cache-slots", engine)
         engine = self.dry_run_config("qwen", CONV_CACHE_DISK_MIB="0")["engine"]
         self.assertNotIn("conversation-cache-disk-mib", engine)
         self.assertEqual(engine["conversation-cache-mib"], 16384)
@@ -940,7 +944,17 @@ class LlmServeGpuWaitTest(unittest.TestCase):
         self.assertFalse(self.logs.exists())
 
     def test_qwen_llama_ignores_conversation_cache(self):
-        out = self.run_serve(free_port(), profile="qwen-llama", DRY_RUN="1", CONV_CACHE_MIB="abc")
+        out = self.run_serve(free_port(), profile="qwen-llama", DRY_RUN="1",
+                             CONV_CACHE_MIB="abc", CONV_CACHE_MIN_TOKENS="abc",
+                             CONV_CACHE_DISK_MIB="abc", CONV_CACHE_SLOTS="abc")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("conversation-cache", out.stdout)
+
+    def test_deepseek_llama_ignores_conversation_cache(self):
+        out = self.run_serve(free_port(), profile="deepseek-llama", DRY_RUN="1",
+                             MOE_CACHE_MIB="65536",
+                             CONV_CACHE_MIB="abc", CONV_CACHE_MIN_TOKENS="abc",
+                             CONV_CACHE_DISK_MIB="abc", CONV_CACHE_SLOTS="abc")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertNotIn("conversation-cache", out.stdout)
 
