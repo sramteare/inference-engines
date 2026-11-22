@@ -190,8 +190,7 @@ Environment overrides:
                      qwen and deepseek: conversation cache disk budget, MiB; the disk tier spills to
                      host disk, not VRAM, and also keeps conversations across server restarts;
                      0 turns the disk tier off (default: 65536 for qwen, 16384 for deepseek)
-                     The CONV_CACHE_* names are shared: a value exported for qwen also applies
-                     to deepseek.
+  The CONV_CACHE_* names are shared: a value exported for qwen also applies to deepseek.
   PORT=N             Server port (default: 8000)
   HOST=ADDR          Bind address (default: 0.0.0.0; 127.0.0.1 for qwen, deepseek and deepseek-maya, the Basalt/Maya profiles)
   MODELS=DIR         Models root directory (default: ~/dev/models)
