@@ -204,7 +204,7 @@ Environment overrides:
   BASALT_DS_DIR=DIR  Basalt build the deepseek profile runs (default: ~/dev/engines/basalt-ds41-056: 0.5.6 with
                      the MXFP4/IQ3_S expert support of upstream PR #481, which BASALT_DIR lacks)
   BASALT_DS_PYTHON=P Python running the BASALT_DS_DIR server (default: $BASALT_DIR/.venv/bin/python;
-                     BASALT_DS_DIR has no .venv of its own)
+                     both default builds' .venv links to ~/dev/basalt-src/.venv, so keep that checkout)
   DRY_RUN=1          Print the full launch command (plus the generated config for
                      qwen / deepseek / deepseek-maya) and exit (no server, no opencode sync, nothing
                      written to LOG_DIR)
@@ -709,7 +709,7 @@ EOF
       # answer-room 0: Basalt's default caps thinking at half of max_tokens.
       # +700 on the reserve: vram-reserve-mib doubles as Basalt's own scratch reserve.
       # Runs from BASALT_DS_DIR (MXFP4/IQ3_S expert support BASALT_DIR lacks),
-      # server started with --python BASALT_DS_PYTHON (BASALT_DS_DIR has no .venv).
+      # server started with --python BASALT_DS_PYTHON (default: BASALT_DIR's .venv).
       # vision is the image encoder, dynamic by default.
       local ctx="${CTX:-524288}"
       [[ -n "$HOST_SET" ]] || HOST="127.0.0.1"
