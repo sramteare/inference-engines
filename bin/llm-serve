@@ -136,8 +136,8 @@ main() {
   DS_NONCACHE_MIB="${DS_NONCACHE_MIB:-23000}"
   MOE_CPU_SHARE="${MOE_CPU_SHARE:-0.85}"
   MAYA_DIR="${MAYA_DIR:-$HOME/dev/maya-src}"
-  BASALT_DIR="${BASALT_DIR:-$HOME/dev/basalt-src}"
-  BASALT_DS_DIR="${BASALT_DS_DIR:-$HOME/dev/basalt-ds41-serve}"
+  BASALT_DIR="${BASALT_DIR:-$HOME/dev/engines/basalt-056}"
+  BASALT_DS_DIR="${BASALT_DS_DIR:-$HOME/dev/engines/basalt-ds41-056}"
   BASALT_DS_PYTHON="${BASALT_DS_PYTHON:-$BASALT_DIR/.venv/bin/python}"
   DAEMON=0
 
@@ -200,11 +200,11 @@ Environment overrides:
   MOE_CPU_SHARE=F    deepseek-llama share of MoE cache misses computed on CPU from RAM experts instead of uploaded to GPU (default: 0.85)
   DS_NONCACHE_MIB=N  deepseek-llama non-cache VRAM estimate for the cache calc, MiB (default: 23000)
   MAYA_DIR=DIR       Project Maya engine directory (default: ~/dev/maya-src)
-  BASALT_DIR=DIR     Basalt engine directory (default: ~/dev/basalt-src)
-  BASALT_DS_DIR=DIR  Basalt build the deepseek profile runs (default: ~/dev/basalt-ds41-serve; has the
-                     MXFP4/IQ3_S expert support ~/dev/basalt-src lacks)
+  BASALT_DIR=DIR     Basalt engine directory (default: ~/dev/engines/basalt-056, Basalt 0.5.6)
+  BASALT_DS_DIR=DIR  Basalt build the deepseek profile runs (default: ~/dev/engines/basalt-ds41-056: 0.5.6 with
+                     the MXFP4/IQ3_S expert support of upstream PR #481, which BASALT_DIR lacks)
   BASALT_DS_PYTHON=P Python running the BASALT_DS_DIR server (default: $BASALT_DIR/.venv/bin/python;
-                     BASALT_DS_DIR has no .venv of its own)
+                     both default builds' .venv links to ~/dev/basalt-src/.venv, so keep that checkout)
   DRY_RUN=1          Print the full launch command (plus the generated config for
                      qwen / deepseek / deepseek-maya) and exit (no server, no opencode sync, nothing
                      written to LOG_DIR)
@@ -708,8 +708,8 @@ EOF
       # DeepSeek-V4.1-Flash-1017 UD-Q2_K_XL on the Basalt engine.
       # answer-room 0: Basalt's default caps thinking at half of max_tokens.
       # +700 on the reserve: vram-reserve-mib doubles as Basalt's own scratch reserve.
-      # Runs from BASALT_DS_DIR (MXFP4/IQ3_S expert support ~/dev/basalt-src lacks),
-      # server started with --python BASALT_DS_PYTHON (BASALT_DS_DIR has no .venv).
+      # Runs from BASALT_DS_DIR (MXFP4/IQ3_S expert support BASALT_DIR lacks),
+      # server started with --python BASALT_DS_PYTHON (default: BASALT_DIR's .venv).
       # vision is the image encoder, dynamic by default.
       local ctx="${CTX:-524288}"
       [[ -n "$HOST_SET" ]] || HOST="127.0.0.1"

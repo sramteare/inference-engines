@@ -66,12 +66,14 @@ verifies each pid file still belongs to one of our servers (recorded start time
 + cmdline) before signalling anything, and stops servers by session, so engine
 children go with them. Environment overrides: `PORT`, `HOST`,
 `CTX`, `SPEC=0` (no speculative decoding), `MODELS`, `LLAMA_BIN`, `LOG_DIR`,
-`MAYA_DIR` (default `~/dev/maya-src`), `BASALT_DIR` (default `~/dev/basalt-src`),
-`BASALT_DS_DIR` (default `~/dev/basalt-ds41-serve`; the Basalt build the
-`deepseek` profile runs, with the MXFP4/IQ3_S expert support
-`~/dev/basalt-src` lacks), `BASALT_DS_PYTHON` (default
+`MAYA_DIR` (default `~/dev/maya-src`),
+`BASALT_DIR` (default `~/dev/engines/basalt-056`, Basalt 0.5.6),
+`BASALT_DS_DIR` (default `~/dev/engines/basalt-ds41-056`; the Basalt build the
+`deepseek` profile runs: 0.5.6 with the MXFP4/IQ3_S expert support of upstream
+PR #481, which `BASALT_DIR` lacks), `BASALT_DS_PYTHON` (default
 `$BASALT_DIR/.venv/bin/python`; the Python that runs the `BASALT_DS_DIR`
-server, since `BASALT_DS_DIR` has no `.venv` of its own),
+server; both default builds' `.venv` is a link to `~/dev/basalt-src/.venv`,
+so that checkout must stay),
 `DRY_RUN=1` (print the command — plus the generated config for the engine
 profiles — and exit; no server, no opencode sync, nothing written to `$LOG_DIR`). Extra arguments after the
 profile go to `llama-server` (or to `maya.py` / `basalt serve`).

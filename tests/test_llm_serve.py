@@ -564,6 +564,24 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                             f"{' '.join(args)} deleted an inherited CONFIG_TMP (rc={out.returncode})")
         self.assertEqual(victim_file.read_text(), "hello")
 
+    def test_help_names_basalt_056_builds(self):
+        port = free_port()
+        out = subprocess.run([str(SCRIPT), "--help"], capture_output=True, text=True,
+                             timeout=30, env=self.serve_env(port))
+        text = out.stdout + out.stderr
+        self.assertEqual(out.returncode, 0, text)
+        self.assertIn("~/dev/engines/basalt-056", text)
+        self.assertIn("~/dev/engines/basalt-ds41-056", text)
+        self.assertNotIn("default: ~/dev/basalt-src", text)
+        self.assertNotIn("basalt-ds41-serve", text)
+
+    def test_dry_run_qwen_defaults_to_basalt_056(self):
+        out = self.run_serve(free_port(), profile="qwen", DRY_RUN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn(str(self.tmp / "home" / "dev" / "engines" / "basalt-056" / "bin" / "basalt"),
+                      out.stdout)
+        self.assertNotIn("basalt-src", out.stdout)
+
     def test_stop_does_not_kill_maya_ds4_lookalike(self):
         # Make global pgrep find nothing, so --stop can never signal a real
         # llama-server that happens to be running on the developer machine.
