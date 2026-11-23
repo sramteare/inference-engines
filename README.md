@@ -73,7 +73,9 @@ children go with them. Environment overrides: `PORT`, `HOST`,
 PR #481, which `BASALT_DIR` lacks), `BASALT_DS_PYTHON` (default
 `$BASALT_DIR/.venv/bin/python`; the Python that runs the `BASALT_DS_DIR`
 server; both default builds' `.venv` is a link to `~/dev/basalt-src/.venv`,
-so that checkout must stay),
+so that checkout must stay; the two build folders sit inside this checkout,
+excluded only by the local `.git/info/exclude`, so never run `git clean -fdx`
+here),
 `DRY_RUN=1` (print the command — plus the generated config for the engine
 profiles — and exit; no server, no opencode sync, nothing written to `$LOG_DIR`). Extra arguments after the
 profile go to `llama-server` (or to `maya.py` / `basalt serve`).
