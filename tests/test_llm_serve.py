@@ -570,15 +570,16 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                              timeout=30, env=self.serve_env(port))
         text = out.stdout + out.stderr
         self.assertEqual(out.returncode, 0, text)
-        self.assertIn("~/dev/engines/basalt-056", text)
-        self.assertIn("~/dev/engines/basalt-ds41-056", text)
+        self.assertIn("~/dev/basalt-builds/basalt-056", text)
+        self.assertIn("~/dev/basalt-builds/basalt-ds41-056", text)
+        self.assertNotIn("~/dev/engines/basalt", text)
         self.assertNotIn("default: ~/dev/basalt-src", text)
         self.assertNotIn("basalt-ds41-serve", text)
 
     def test_dry_run_qwen_defaults_to_basalt_056(self):
         out = self.run_serve(free_port(), profile="qwen", DRY_RUN="1")
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        self.assertIn(str(self.tmp / "home" / "dev" / "engines" / "basalt-056" / "bin" / "basalt"),
+        self.assertIn(str(self.tmp / "home" / "dev" / "basalt-builds" / "basalt-056" / "bin" / "basalt"),
                       out.stdout)
         self.assertNotIn("basalt-src", out.stdout)
 

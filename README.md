@@ -67,8 +67,8 @@ verifies each pid file still belongs to one of our servers (recorded start time
 children go with them. Environment overrides: `PORT`, `HOST`,
 `CTX`, `SPEC=0` (no speculative decoding), `MODELS`, `LLAMA_BIN`, `LOG_DIR`,
 `MAYA_DIR` (default `~/dev/maya-src`),
-`BASALT_DIR` (default `~/dev/engines/basalt-056`, Basalt 0.5.6),
-`BASALT_DS_DIR` (default `~/dev/engines/basalt-ds41-056`; the Basalt build the
+`BASALT_DIR` (default `~/dev/basalt-builds/basalt-056`, Basalt 0.5.6),
+`BASALT_DS_DIR` (default `~/dev/basalt-builds/basalt-ds41-056`; the Basalt build the
 `deepseek` profile runs: 0.5.6 with the MXFP4/IQ3_S expert support of upstream
 PR #481, which `BASALT_DIR` lacks), `BASALT_DS_PYTHON` (default
 `$BASALT_DIR/.venv/bin/python`; the Python that runs the `BASALT_DS_DIR`
