@@ -128,6 +128,7 @@ main() {
   VISION="${VISION:-dynamic}"
   # ${VAR+set} (no colon): an explicitly set empty value still counts as set,
   # so the profile default below leaves it alone and the validation refuses it.
+  GPUS_SET="${GPUS+set}"
   CONV_CACHE_MIB_SET="${CONV_CACHE_MIB+set}"
   CONV_CACHE_MIN_TOKENS_SET="${CONV_CACHE_MIN_TOKENS+set}"
   CONV_CACHE_DISK_MIB_SET="${CONV_CACHE_DISK_MIB+set}"
@@ -158,6 +159,8 @@ Profiles:
   qwen-llama      Qwen UD-Q4_K_XL + MTP Q8_0, 256k ctx, f16 KV, -fitt (llama.cpp fallback)
   deepseek-llama  DeepSeek UD-Q2_K_XL + DSpark Q8_0, 512k ctx, GPU expert cache + CPU share (llama.cpp fallback)
   qwen-basalt / deepseek-basalt  aliases of qwen / deepseek
+  qwen-pair       Qwen on each card: GPU 0 on PORT, GPU 1 on PORT2 (default PORT+1); needs -d
+  duo             Qwen on GPU 0 at PORT, DeepSeek on GPU 1 at PORT2 (default PORT+1); needs -d
 
 Flags / Subcommands:
   -d                Run server in background (logs to $LOG_DIR/llama-<profile>.log)
@@ -177,6 +180,8 @@ Environment overrides:
                      deepseek: dynamic (default; the encoder runs on the GPU for requests with pictures,
                      at the cost of about one expert per layer of GPU cache), cpu, off or a GPU number.
                      deepseek-maya: on / dynamic (default, both mean on) or off. Other profiles ignore it.
+  GPUS=LIST          qwen and deepseek: the cards Basalt uses, nvidia-smi numbers, the first is the
+                     main card (default: 0 for qwen, 0,1 for deepseek); 0 = one card; auto = every Blackwell card.
   CONV_CACHE_MIB=N   qwen and deepseek: Basalt conversation cache RAM budget, MiB; parked conversations
                      are kept in host RAM, not VRAM; 0 turns the RAM tier off
                      (default: 16384 for qwen, 2048 for deepseek)
@@ -192,6 +197,7 @@ Environment overrides:
                      0 turns the disk tier off (default: 65536 for qwen, 16384 for deepseek)
   The CONV_CACHE_* names are shared: a value exported for qwen also applies to deepseek.
   PORT=N             Server port (default: 8000)
+  PORT2=N            qwen-pair and duo: port of the second (GPU 1) server (default: PORT+1)
   HOST=ADDR          Bind address (default: 0.0.0.0; 127.0.0.1 for qwen, deepseek and deepseek-maya, the Basalt/Maya profiles)
   MODELS=DIR         Models root directory (default: ~/dev/models)
   LOG_DIR=DIR        Log directory (default: ~/dev/engines/logs)
@@ -474,6 +480,8 @@ EOF
       echo "  qwen-llama      Qwen UD-Q4_K_XL + MTP Q8_0, 256k ctx, f16 KV, -fitt (llama.cpp fallback)"
       echo "  deepseek-llama  DeepSeek UD-Q2_K_XL + DSpark Q8_0, 512k ctx, GPU expert cache + CPU share (llama.cpp fallback)"
       echo "  qwen-basalt / deepseek-basalt  aliases of qwen / deepseek"
+      echo "  qwen-pair       Qwen on each card: GPU 0 on PORT, GPU 1 on PORT2 (default PORT+1); needs -d"
+      echo "  duo             Qwen on GPU 0 at PORT, DeepSeek on GPU 1 at PORT2 (default PORT+1); needs -d"
       return 0
       ;;
     --stop|stop)
@@ -503,12 +511,54 @@ EOF
   # fails instantly, not after GPU_WAIT_S. Keep this list in sync with the
   # profile case below.
   case "$PROFILE" in
-    qwen|deepseek|deepseek-maya|qwen-llama|deepseek-llama) ;;
+    qwen|qwen-pair|duo|deepseek|deepseek-maya|qwen-llama|deepseek-llama) ;;
     *)
       echo "Unknown profile or flag: $PROFILE (try: llm-serve --help)" >&2
       return 1
       ;;
   esac
+  # Internal (set by qwen-pair for the GPU 1 server; empty otherwise): suffix
+  # for the qwen config, log and conversation folder, so it must be path-safe.
+  if [[ -n "${LLM_SERVE_INSTANCE:-}" && ! "$LLM_SERVE_INSTANCE" =~ ^[a-z0-9-]+$ ]]; then
+    echo "llm-serve: LLM_SERVE_INSTANCE must match ^[a-z0-9-]+$ (got: $LLM_SERVE_INSTANCE)" >&2
+    return 1
+  fi
+  # Qwen on two cards is no faster than on one (all its experts fit on one
+  # card), but two single-card servers each run at full speed: re-run this
+  # script once per card. Only in the background: the foreground would show
+  # and own the first server while the second one waits. duo runs Qwen on
+  # card 0 and DeepSeek on card 1 the same way.
+  if [[ "$PROFILE" == qwen-pair || "$PROFILE" == duo ]]; then
+    if [[ ! "$PORT" =~ ^[0-9]+$ ]]; then
+      echo "llm-serve: $PROFILE: PORT must be a number (got: $PORT)" >&2
+      return 1
+    fi
+    local port2="${PORT2:-$(( 10#$PORT + 1 ))}"
+    if [[ ! "$port2" =~ ^[0-9]+$ ]]; then
+      echo "llm-serve: $PROFILE: PORT2 must be a number (got: $port2)" >&2
+      return 1
+    fi
+    if (( ! DAEMON )) && [[ "${DRY_RUN:-0}" != 1 ]]; then
+      echo "llm-serve: $PROFILE runs two background servers: use llm-serve -d $PROFILE" >&2
+      return 1
+    fi
+    local rc=0
+    GPUS=0 PORT="$PORT" "$0" -d qwen "$@" || rc=$?
+    if (( rc != 0 )); then
+      return "$rc"
+    fi
+    # The first server is ours and holds card 0: the second must not wait for it.
+    if [[ "$PROFILE" == duo ]]; then
+      # Qwen and deepseek already use separate configs, logs and conversation
+      # folders, so the second server needs no LLM_SERVE_INSTANCE here.
+      GPUS=1 PORT="$port2" ALLOW_SHARED_GPU=1 OPENCODE_SYNC=0 \
+        "$0" -d deepseek "$@" || rc=$?
+    else
+      GPUS=1 PORT="$port2" ALLOW_SHARED_GPU=1 OPENCODE_SYNC=0 LLM_SERVE_INSTANCE=gpu1 \
+        "$0" -d qwen "$@" || rc=$?
+    fi
+    return "$rc"
+  fi
   # Only qwen, deepseek and deepseek-maya read VISION; check it here so a typo
   # also fails before the GPU wait. Maya's --vision is a plain on/off switch.
   if [[ "$PROFILE" == qwen && ! "$VISION" =~ ^(off|dynamic|cpu|[0-9]+)$ ]]; then
@@ -521,6 +571,23 @@ EOF
   fi
   if [[ "$PROFILE" == deepseek-maya && ! "$VISION" =~ ^(on|dynamic|off)$ ]]; then
     echo "llm-serve: deepseek-maya: VISION must be on, dynamic or off (got: $VISION)" >&2
+    return 1
+  fi
+  # GPUS defaults are per-profile: all Qwen experts fit on one card, DeepSeek
+  # is faster on two. An explicitly set GPUS (even an empty one, refused below)
+  # wins for either profile.
+  if [[ -z "$GPUS_SET" ]]; then
+    case "$PROFILE" in
+      deepseek) GPUS="0,1" ;;
+      *) GPUS="0" ;;
+    esac
+  fi
+  # Only qwen and deepseek read GPUS; check it here like VISION, before the GPU
+  # wait and any start, so a bad value fails fast (also under DRY_RUN). Basalt
+  # wants nvidia-smi card numbers, comma-separated (the first is the main card),
+  # or auto.
+  if [[ ( "$PROFILE" == qwen || "$PROFILE" == deepseek ) && ! "$GPUS" =~ ^(auto|[0-9]+(,[0-9]+)*)$ ]]; then
+    echo "llm-serve: GPUS must be auto or card numbers like 0 or 0,1 (got: $GPUS)" >&2
     return 1
   fi
   # Conversation cache defaults are per-profile; an explicitly set value (even
@@ -735,8 +802,9 @@ EOF
         --argjson cc_min_tokens "$CONV_CACHE_MIN_TOKENS" \
         --argjson cc_disk_mib "$CONV_CACHE_DISK_MIB" \
         --argjson cc_slots "$CONV_CACHE_SLOTS" \
+        --arg gpus "$GPUS" \
         '{version: 2,
-          models: [{alias: "deepseek-v4.1-flash", model: $model, gpu: "0"}],
+          models: [{alias: "deepseek-v4.1-flash", model: $model, gpu: $gpus}],
           engine: ({"max-context": $ctx, "vram-reserve-mib": $rsv, "answer-room": 0,
                     vision: (if ($vision | test("^[0-9]+$")) then ($vision | tonumber) else $vision end)}
                    + (if $spec == 0 then {spec: 0} else {} end)
@@ -797,7 +865,8 @@ EOF
       # +700 on the reserve: vram-reserve-mib doubles as Basalt's own scratch reserve.
       local ctx="${CTX:-262144}"
       [[ -n "$HOST_SET" ]] || HOST="127.0.0.1"
-      CONFIG="$LOG_DIR/basalt-qwen.json"
+      # LLM_SERVE_INSTANCE (qwen-pair's second server) separates the config.
+      CONFIG="$LOG_DIR/basalt-qwen${LLM_SERVE_INSTANCE:+-$LLM_SERVE_INSTANCE}.json"
       CONFIG_TMP="$(mktemp)"
       jq -n \
         --arg model "$MODELS/qwen3.8-unsloth-v3.1/basalt/Qwen3.8-FN-UD-Q4_K_XL.basalt" \
@@ -811,8 +880,11 @@ EOF
         --argjson cc_min_tokens "$CONV_CACHE_MIN_TOKENS" \
         --argjson cc_disk_mib "$CONV_CACHE_DISK_MIB" \
         --argjson cc_slots "$CONV_CACHE_SLOTS" \
+        --arg gpus "$GPUS" \
+        --arg inst "${LLM_SERVE_INSTANCE:-}" \
+        --arg cc_dir "$HOME/.cache/basalt/qwen-${LLM_SERVE_INSTANCE:-}/conversations" \
         '{version: 2,
-          models: [{alias: "qwen3.8-flash-next", model: $model, gpu: "0", kv: "fp16"}],
+          models: [{alias: "qwen3.8-flash-next", model: $model, gpu: $gpus, kv: "fp16"}],
           engine: ({"max-context": $ctx, "vram-reserve-mib": $rsv,
                     "resident-experts": true, "answer-room": 0,
                     vision: (if ($vision | test("^[0-9]+$")) then ($vision | tonumber) else $vision end)}
@@ -821,7 +893,9 @@ EOF
                                            "conversation-cache-slots": $cc_slots} else {} end)
                    + (if ($cc_mib > 0 or $cc_disk_mib > 0) then
                         {"conversation-cache-min-tokens": $cc_min_tokens} else {} end)
-                   + (if $cc_disk_mib > 0 then {"conversation-cache-disk-mib": $cc_disk_mib} else {} end)),
+                   + (if $cc_disk_mib > 0 then {"conversation-cache-disk-mib": $cc_disk_mib} else {} end)
+                   + (if ($inst != "" and $cc_disk_mib > 0) then
+                        {"conversation-cache-dir": $cc_dir} else {} end)),
           server: {host: $host, port: $port}}' > "$CONFIG_TMP"
       RUN_CWD="$BASALT_DIR"
       CMD=("$BASALT_DIR/bin/basalt" serve --config "$CONFIG" "$@")
@@ -901,7 +975,13 @@ EOF
 
   sync_opencode
 
-  local LOG="$LOG_DIR/llama-$PROFILE.log"
+  # LLM_SERVE_INSTANCE (qwen-pair's second server) separates its log too.
+  local LOG
+  if [[ "$PROFILE" == qwen && -n "${LLM_SERVE_INSTANCE:-}" ]]; then
+    LOG="$LOG_DIR/llama-qwen-$LLM_SERVE_INSTANCE.log"
+  else
+    LOG="$LOG_DIR/llama-$PROFILE.log"
+  fi
 
   echo "Profile: $PROFILE   Endpoint: http://$HOST:$PORT/v1   Log: $LOG"
   echo "Status:  llm-serve --status   Live stats: llm-serve --stats   Stop: llm-serve --stop"
