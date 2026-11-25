@@ -785,6 +785,172 @@ class LlmServeGpuWaitTest(unittest.TestCase):
             self.assertEqual(engine["vision"], want, value)
             self.assertIs(type(engine["vision"]), type(want), value)
 
+    def test_qwen_gpus(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        cfg = self.dry_run_config("qwen")
+        self.assertEqual(cfg["models"][0]["gpu"], "0")
+        for value, want in (("0", "0"), ("0,1", "0,1"), ("auto", "auto"), ("1,0", "1,0")):
+            gpu = self.dry_run_config("qwen", GPUS=value)["models"][0]["gpu"]
+            self.assertEqual(gpu, want, value)
+            self.assertIs(type(gpu), str, value)
+
+    def pair_configs(self, stdout):
+        # qwen-pair under DRY_RUN prints two blocks: command line,
+        # "# <config path>", config JSON. raw_decode stops at the end of each
+        # JSON object, so the next block's command line is ignored.
+        dec = json.JSONDecoder()
+        blocks = []
+        for chunk in stdout.split("\n# ")[1:]:
+            path, rest = chunk.split("\n", 1)
+            cfg, _ = dec.raw_decode(rest.lstrip())
+            blocks.append((path, cfg))
+        return blocks
+
+    def test_qwen_pair_dry_run(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        port = free_port()
+        out = self.run_serve(port, profile="qwen-pair", DRY_RUN="1")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        blocks = self.pair_configs(out.stdout)
+        self.assertEqual(len(blocks), 2, out.stdout)
+        (path1, first), (path2, second) = blocks
+        self.assertTrue(path1.endswith("/basalt-qwen.json"), path1)
+        self.assertEqual(first["models"][0]["gpu"], "0")
+        self.assertEqual(first["server"]["port"], port)
+        self.assertNotIn("conversation-cache-dir", first["engine"])
+        self.assertTrue(path2.endswith("/basalt-qwen-gpu1.json"), path2)
+        self.assertEqual(second["models"][0]["gpu"], "1")
+        self.assertEqual(second["server"]["port"], port + 1)
+        self.assertTrue(
+            second["engine"]["conversation-cache-dir"].endswith("qwen-gpu1/conversations"),
+            second["engine"].get("conversation-cache-dir"))
+        port = free_port()
+        out = self.run_serve(port, profile="qwen-pair", DRY_RUN="1", PORT2=str(port + 77))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        blocks = self.pair_configs(out.stdout)
+        self.assertEqual(len(blocks), 2, out.stdout)
+        self.assertEqual(blocks[1][1]["server"]["port"], port + 77)
+
+    def test_qwen_pair_bad_port2(self):
+        out = self.run_serve(free_port(), profile="qwen-pair", DRY_RUN="1", PORT2="x")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("PORT2 must be a number", out.stderr)
+
+    def test_qwen_pair_needs_daemon(self):
+        basalt_dir = self.tmp / "basalt-dir"
+        (basalt_dir / "bin").mkdir(parents=True)
+        basalt = basalt_dir / "bin" / "basalt"
+        basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        basalt.chmod(0o755)
+        out = self.run_serve(free_port(), profile="qwen-pair", BASALT_DIR=str(basalt_dir))
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("llm-serve: qwen-pair runs two background servers: "
+                      "use llm-serve -d qwen-pair", out.stderr)
+        self.assertNotIn(MARKER, out.stdout)
+        self.assertFalse(self.logs.exists())
+
+    def test_duo_dry_run(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        ds_dir = self.tmp / "basalt-ds-dir"
+        (ds_dir / "bin").mkdir(parents=True)
+        ds_basalt = ds_dir / "bin" / "basalt"
+        ds_basalt.write_text("#!/bin/sh\nexit 0\n")
+        ds_basalt.chmod(0o755)
+        ds_python = self.tmp / "basalt-ds-python"
+        ds_python.write_text("#!/bin/sh\nexit 0\n")
+        ds_python.chmod(0o755)
+        env = {"BASALT_DS_DIR": str(ds_dir), "BASALT_DS_PYTHON": str(ds_python)}
+        port = free_port()
+        out = self.run_serve(port, profile="duo", DRY_RUN="1", **env)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        blocks = self.pair_configs(out.stdout)
+        self.assertEqual(len(blocks), 2, out.stdout)
+        (path1, first), (path2, second) = blocks
+        self.assertTrue(path1.endswith("/basalt-qwen.json"), path1)
+        self.assertEqual(first["models"][0]["gpu"], "0")
+        self.assertEqual(first["server"]["port"], port)
+        self.assertTrue(path2.endswith("/basalt-deepseek.json"), path2)
+        self.assertEqual(second["models"][0]["gpu"], "1")
+        self.assertEqual(second["server"]["port"], port + 1)
+        port = free_port()
+        out = self.run_serve(port, profile="duo", DRY_RUN="1", PORT2=str(port + 77), **env)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        blocks = self.pair_configs(out.stdout)
+        self.assertEqual(len(blocks), 2, out.stdout)
+        self.assertEqual(blocks[1][1]["server"]["port"], port + 77)
+
+    def test_duo_bad_port2(self):
+        out = self.run_serve(free_port(), profile="duo", DRY_RUN="1", PORT2="x")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("PORT2 must be a number", out.stderr)
+
+    def test_duo_needs_daemon(self):
+        basalt_dir = self.tmp / "basalt-dir"
+        (basalt_dir / "bin").mkdir(parents=True)
+        basalt = basalt_dir / "bin" / "basalt"
+        basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        basalt.chmod(0o755)
+        out = self.run_serve(free_port(), profile="duo", BASALT_DIR=str(basalt_dir))
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("llm-serve: duo runs two background servers: "
+                      "use llm-serve -d duo", out.stderr)
+        self.assertNotIn(MARKER, out.stdout)
+        self.assertFalse(self.logs.exists())
+
+    def test_pair_port2_same_as_port(self):
+        for profile in ("qwen-pair", "duo"):
+            port = free_port()
+            out = self.run_serve(port, profile=profile, DRY_RUN="1", PORT2=str(port))
+            self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+            self.assertIn("PORT2 must differ from PORT", out.stderr)
+
+    def test_pair_port2_out_of_range(self):
+        for port2 in ("70000", "0"):
+            out = self.run_serve(free_port(), profile="qwen-pair", DRY_RUN="1", PORT2=port2)
+            self.assertEqual(out.returncode, 1, f"{port2}: {out.stdout}{out.stderr}")
+            self.assertIn("between 1 and 65535", out.stderr)
+
+    def test_pair_port2_busy(self):
+        # A listener held open by this test: bind to 0 and take the port, so no
+        # free_port()-style gap lets another process claim it in between.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        busy_port = listener.getsockname()[1]
+        basalt_dir = self.tmp / "basalt-dir"
+        (basalt_dir / "bin").mkdir(parents=True)
+        basalt = basalt_dir / "bin" / "basalt"
+        basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        basalt.chmod(0o755)
+        out = self.run_serve(free_port(), profile="qwen-pair",
+                             PORT2=str(busy_port), BASALT_DIR=str(basalt_dir))
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn(f"already listening on port {busy_port}", out.stderr)
+        self.assertNotIn(MARKER, out.stdout)
+        self.assertFalse(self.logs.exists())
+
+    def test_pair_ignores_inherited_instance(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        out = self.run_serve(free_port(), profile="qwen-pair", DRY_RUN="1",
+                             LLM_SERVE_INSTANCE="foo")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        blocks = self.pair_configs(out.stdout)
+        self.assertEqual(len(blocks), 2, out.stdout)
+        self.assertTrue(blocks[0][0].endswith("/basalt-qwen.json"), blocks[0][0])
+        self.assertTrue(blocks[1][0].endswith("/basalt-qwen-gpu1.json"), blocks[1][0])
+
+    def test_invalid_instance(self):
+        out = self.run_serve(free_port(), profile="qwen", LLM_SERVE_INSTANCE="a b")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("LLM_SERVE_INSTANCE", out.stderr)
+        self.assertNotIn(MARKER, out.stdout)
+        self.assertFalse(self.logs.exists())
+
     def test_invalid_vision_refuses_before_starting(self):
         basalt_dir = self.tmp / "basalt-dir"
         (basalt_dir / "bin").mkdir(parents=True)
@@ -800,6 +966,36 @@ class LlmServeGpuWaitTest(unittest.TestCase):
                 self.assertIn("VISION must be", out.stderr)
                 self.assertNotIn(MARKER, out.stdout)
                 self.assertNotIn(str(basalt), out.stdout)
+        self.assertFalse(self.logs.exists())
+
+    def test_invalid_gpus_refuses_before_starting(self):
+        basalt_dir = self.tmp / "basalt-dir"
+        (basalt_dir / "bin").mkdir(parents=True)
+        basalt = basalt_dir / "bin" / "basalt"
+        basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        basalt.chmod(0o755)
+        ds_dir = self.tmp / "basalt-ds-dir"
+        (ds_dir / "bin").mkdir(parents=True)
+        ds_basalt = ds_dir / "bin" / "basalt"
+        ds_basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        ds_basalt.chmod(0o755)
+        ds_python = self.tmp / "basalt-ds-python"
+        ds_python.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        ds_python.chmod(0o755)
+        self.write_holders()
+        profiles = (
+            ("qwen", {"BASALT_DIR": str(basalt_dir)}),
+            ("deepseek", {"BASALT_DS_DIR": str(ds_dir), "BASALT_DS_PYTHON": str(ds_python)}),
+        )
+        for profile, extra in profiles:
+            for bad in ("0 1", "0,,1", "a", "-1", "0,1,"):
+                for dry in ("0", "1"):
+                    out = self.run_serve(free_port(), profile=profile, GPUS=bad,
+                                         DRY_RUN=dry, **extra)
+                    self.assertEqual(out.returncode, 1,
+                                     f"{profile} {bad!r}: {out.stdout}{out.stderr}")
+                    self.assertIn("GPUS must be", out.stderr)
+                    self.assertNotIn(MARKER, out.stdout)
         self.assertFalse(self.logs.exists())
 
     def test_qwen_conversation_cache(self):
@@ -1007,6 +1203,25 @@ class LlmServeGpuWaitTest(unittest.TestCase):
             engine = self.dry_run_config("deepseek", VISION=value, **env)["engine"]
             self.assertEqual(engine["vision"], want, value)
             self.assertIs(type(engine["vision"]), type(want), value)
+
+    def test_deepseek_basalt_gpus(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        ds_dir = self.tmp / "basalt-ds-dir"
+        (ds_dir / "bin").mkdir(parents=True)
+        ds_basalt = ds_dir / "bin" / "basalt"
+        ds_basalt.write_text("#!/bin/sh\nexit 0\n")
+        ds_basalt.chmod(0o755)
+        ds_python = self.tmp / "basalt-ds-python"
+        ds_python.write_text("#!/bin/sh\nexit 0\n")
+        ds_python.chmod(0o755)
+        env = {"BASALT_DS_DIR": str(ds_dir), "BASALT_DS_PYTHON": str(ds_python)}
+        cfg = self.dry_run_config("deepseek", **env)
+        self.assertEqual(cfg["models"][0]["gpu"], "0,1")
+        for value, want in (("0", "0"), ("auto", "auto"), ("1,0", "1,0")):
+            gpu = self.dry_run_config("deepseek", GPUS=value, **env)["models"][0]["gpu"]
+            self.assertEqual(gpu, want, value)
+            self.assertIs(type(gpu), str, value)
 
     def test_deepseek_basalt_invalid_vision_refuses_before_starting(self):
         ds_dir = self.tmp / "basalt-ds-dir"

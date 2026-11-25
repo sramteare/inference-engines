@@ -58,16 +58,22 @@ DRY_RUN=1 llm-serve qwen    # print the full launch command, start nothing
 All profiles serve on port 8000, one at a time. `qwen` and `deepseek` run the
 models on the Basalt engine and `deepseek-maya` on Project Maya instead of
 llama.cpp (`qwen-basalt` and `deepseek-basalt` are kept as aliases of
-`qwen` and `deepseek`); `llm-serve`
+`qwen` and `deepseek`, and `qwen-pair` starts one Qwen server per card — GPU 0
+on `PORT`, GPU 1 on `PORT2`, default `PORT`+1 — because two single-card Qwen
+servers each run at full speed while one on two cards does not, so it needs
+`-d`); `llm-serve`
 generates their config into `$LOG_DIR` (from
 `$MAYA_DIR/maya-ds4.json`, minus the refusal-direction ablation args and the
 `ablate` keys, for Maya) and `--status` / `--stop` cover them too: `--stop`
 verifies each pid file still belongs to one of our servers (recorded start time
 + cmdline) before signalling anything, and stops servers by session, so engine
-children go with them. Environment overrides: `PORT`, `HOST`,
+children go with them. `duo` runs Qwen on GPU 0 at `PORT` and DeepSeek on GPU 1
+at `PORT2` (default `PORT`+1), also needs `-d`, and clients reach DeepSeek on
+`PORT2`. Environment overrides: `PORT`, `HOST`,
 `CTX`, `SPEC=0` (no speculative decoding), `MODELS`, `LLAMA_BIN`, `LOG_DIR`,
 `MAYA_DIR` (default `~/dev/maya-src`),
 `BASALT_DIR` (default `~/dev/basalt-builds/basalt-056`, Basalt 0.5.6),
+`GPUS` (qwen and deepseek: the nvidia-smi cards Basalt uses, comma-separated, the first is the main card; default `0` for qwen, `0,1` for deepseek, or `auto` for every Blackwell card),
 `BASALT_DS_DIR` (default `~/dev/basalt-builds/basalt-ds41-056`; the Basalt build the
 `deepseek` profile runs: 0.5.6 with the MXFP4/IQ3_S expert support of upstream
 PR #481, which `BASALT_DIR` lacks), `BASALT_DS_PYTHON` (default
