@@ -538,12 +538,39 @@ EOF
       echo "llm-serve: $PROFILE: PORT2 must be a number (got: $port2)" >&2
       return 1
     fi
+    # Both passed ^[0-9]+$ above, so 10#$... inside (( )) is safe (it also
+    # keeps leading-zero values out of octal).
+    if (( 10#$PORT < 1 || 10#$PORT > 65535 )); then
+      echo "llm-serve: $PROFILE: PORT must be between 1 and 65535 (got: $PORT)" >&2
+      return 1
+    fi
+    if (( 10#$port2 < 1 || 10#$port2 > 65535 )); then
+      echo "llm-serve: $PROFILE: PORT2 must be between 1 and 65535 (got: $port2)" >&2
+      return 1
+    fi
+    # Compare as numbers, so e.g. 08000 and 8000 count as the same port.
+    if (( 10#$PORT == 10#$port2 )); then
+      echo "llm-serve: $PROFILE: PORT2 must differ from PORT (both $PORT)" >&2
+      return 1
+    fi
+    # Fail fast on a busy port, before the first server is even started.
+    if [[ "${DRY_RUN:-0}" != 1 ]]; then
+      local p
+      for p in "$PORT" "$port2"; do
+        if ss -ltnH "sport = :$p" 2>/dev/null | grep -q .; then
+          echo "llm-serve: $PROFILE: Something is already listening on port $p. Stop it with: llm-serve --stop $p" >&2
+          return 1
+        fi
+      done
+    fi
     if (( ! DAEMON )) && [[ "${DRY_RUN:-0}" != 1 ]]; then
       echo "llm-serve: $PROFILE runs two background servers: use llm-serve -d $PROFILE" >&2
       return 1
     fi
     local rc=0
-    GPUS=0 PORT="$PORT" "$0" -d qwen "$@" || rc=$?
+    # LLM_SERVE_INSTANCE= clears any inherited value: card 0 is the base
+    # server, no matter what the caller had set.
+    LLM_SERVE_INSTANCE= GPUS=0 PORT="$PORT" "$0" -d qwen "$@" || rc=$?
     if (( rc != 0 )); then
       return "$rc"
     fi
@@ -551,11 +578,14 @@ EOF
     if [[ "$PROFILE" == duo ]]; then
       # Qwen and deepseek already use separate configs, logs and conversation
       # folders, so the second server needs no LLM_SERVE_INSTANCE here.
-      GPUS=1 PORT="$port2" ALLOW_SHARED_GPU=1 OPENCODE_SYNC=0 \
+      LLM_SERVE_INSTANCE= GPUS=1 PORT="$port2" ALLOW_SHARED_GPU=1 OPENCODE_SYNC=0 \
         "$0" -d deepseek "$@" || rc=$?
     else
       GPUS=1 PORT="$port2" ALLOW_SHARED_GPU=1 OPENCODE_SYNC=0 LLM_SERVE_INSTANCE=gpu1 \
         "$0" -d qwen "$@" || rc=$?
+    fi
+    if (( rc != 0 )); then
+      echo "llm-serve: $PROFILE: the second server (port $port2) did not start; the first is still running on port $PORT (stop it with: llm-serve --stop $PORT)" >&2
     fi
     return "$rc"
   fi

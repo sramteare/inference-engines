@@ -900,6 +900,50 @@ class LlmServeGpuWaitTest(unittest.TestCase):
         self.assertNotIn(MARKER, out.stdout)
         self.assertFalse(self.logs.exists())
 
+    def test_pair_port2_same_as_port(self):
+        for profile in ("qwen-pair", "duo"):
+            port = free_port()
+            out = self.run_serve(port, profile=profile, DRY_RUN="1", PORT2=str(port))
+            self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+            self.assertIn("PORT2 must differ from PORT", out.stderr)
+
+    def test_pair_port2_out_of_range(self):
+        for port2 in ("70000", "0"):
+            out = self.run_serve(free_port(), profile="qwen-pair", DRY_RUN="1", PORT2=port2)
+            self.assertEqual(out.returncode, 1, f"{port2}: {out.stdout}{out.stderr}")
+            self.assertIn("between 1 and 65535", out.stderr)
+
+    def test_pair_port2_busy(self):
+        # A listener held open by this test: bind to 0 and take the port, so no
+        # free_port()-style gap lets another process claim it in between.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        busy_port = listener.getsockname()[1]
+        basalt_dir = self.tmp / "basalt-dir"
+        (basalt_dir / "bin").mkdir(parents=True)
+        basalt = basalt_dir / "bin" / "basalt"
+        basalt.write_text(f"#!/bin/sh\necho {MARKER}\n")
+        basalt.chmod(0o755)
+        out = self.run_serve(free_port(), profile="qwen-pair",
+                             PORT2=str(busy_port), BASALT_DIR=str(basalt_dir))
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn(f"already listening on port {busy_port}", out.stderr)
+        self.assertNotIn(MARKER, out.stdout)
+        self.assertFalse(self.logs.exists())
+
+    def test_pair_ignores_inherited_instance(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not found on this machine")
+        out = self.run_serve(free_port(), profile="qwen-pair", DRY_RUN="1",
+                             LLM_SERVE_INSTANCE="foo")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        blocks = self.pair_configs(out.stdout)
+        self.assertEqual(len(blocks), 2, out.stdout)
+        self.assertTrue(blocks[0][0].endswith("/basalt-qwen.json"), blocks[0][0])
+        self.assertTrue(blocks[1][0].endswith("/basalt-qwen-gpu1.json"), blocks[1][0])
+
     def test_invalid_instance(self):
         out = self.run_serve(free_port(), profile="qwen", LLM_SERVE_INSTANCE="a b")
         self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
