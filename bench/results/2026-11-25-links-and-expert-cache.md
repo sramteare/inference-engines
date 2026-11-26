@@ -84,4 +84,4 @@ step sess turn  out  hit%   pcie%  lookups
   11  B     5  1000   44.9    0.0  230683
 ```
 
-The 132 fixed experts per layer are ranked once and suit code. The adaptive slots lift both sessions to 92–97%, and the first request after a switch is already at 95%. The counts are per request, so they don't show how fast the cache adapts within one.
+With the slots frozen, code does much better than Chinese, so the fixed set suits code. (The 132 fixed and 28 adaptive experts per layer come from the engine log's "VRAM expert tier 160 of 384 experts per layer (132 beside the prompt workspaces)" line and Basalt's `src/core/expert_tier.cpp`, not from this output.) The adaptive slots lift both sessions to 92–97%. A switch costs little: B's first request reached 95.2%, and A's first request after each switch back reached 92–93%, against 92–95% for A otherwise. The counts are per request, so they don't show how fast the cache adapts within one.

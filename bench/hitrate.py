@@ -40,12 +40,13 @@ for i, s in enumerate(plan):
     hit = None
     for _ in range(20):
         new = log_lines()[n0:]
-        hits = [RX.search(l) for l in new if RX.search(l)]
+        hits = [m for m in map(RX.search, new) if m]
         if hits: hit = hits[-1]; break
         time.sleep(0.25)
     out = r["usage"]["completion_tokens"]
     if hit:
         print(f"{i:4d}  {s}   {turn[s]:3d}  {out:4d}  {float(hit[1]):5.1f}  {float(hit[5] or 0):5.1f}  {hit[3]}", flush=True)
     else:
-        print(f"{i:4d}  {s}   {turn[s]:3d}  {out:4d}  (no hit line)", flush=True)
+        print(f"hitrate: no hit-rate line in the engine log within 5 s of request {i}; stopping so a late line is not counted for the next request", file=sys.stderr, flush=True)
+        sys.exit(1)
     turn[s] += 1
