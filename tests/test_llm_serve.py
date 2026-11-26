@@ -1294,5 +1294,107 @@ class LlmServeGpuWaitTest(unittest.TestCase):
         self.assertIn("VISION must be off, dynamic, cpu or a GPU number", out.stderr)
 
 
+class LlmServeStatsTest(unittest.TestCase):
+    """--stats passes every --port it is given, in order, on to llm-stats."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="llm-serve-stats-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # bin/llm-serve copied next to a stub llm-stats: llm-serve resolves
+        # ENGINES as the parent of its script's real directory, so the copy
+        # calls the stub instead of the real llm-stats.
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        serve = self.bin / "llm-serve"
+        shutil.copy(SCRIPT, serve)
+        serve.chmod(0o755)
+        stats = self.bin / "llm-stats"
+        stats.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\nexit 0\n")
+        stats.chmod(0o755)
+        self.logs = self.tmp / "logs"
+        self.logs.mkdir()
+        # Stub `ss` first on PATH: the real machine has live servers listening
+        # on 8000/8001 that these tests must never see.
+        self.stub_bin = self.tmp / "stub"
+        self.stub_bin.mkdir()
+        ss = self.stub_bin / "ss"
+        ss.write_text("#!/bin/sh\nexit 0\n")
+        ss.chmod(0o755)
+        self.procs = []
+
+    def tearDown(self):
+        # Kill only by the pids we started: a name or pattern kill could match
+        # this test runner itself.
+        for p in self.procs:
+            try:
+                os.kill(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.wait()
+
+    def fake_server(self, port):
+        # A session leader named *basalt* (see is_our_cmd), like a real
+        # setsid-launched server, plus the pid file find_servers reads:
+        # "<pid> <starttime>" with starttime field 22 of /proc/<pid>/stat.
+        p = subprocess.Popen(["setsid", "bash", "-c", "exec -a basalt sleep 60"])
+        self.procs.append(p)
+        cmdline = Path(f"/proc/{p.pid}/cmdline")
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                argv0 = cmdline.read_bytes().split(b"\0", 1)[0]
+            except OSError:
+                argv0 = b""
+            if argv0 == b"basalt":
+                break  # exec -a has happened: the name is final
+            if time.monotonic() > deadline:
+                self.fail(f"fake server on port {port} never renamed itself")
+            time.sleep(0.05)
+        stat = Path(f"/proc/{p.pid}/stat").read_text()
+        rest = stat.rsplit(") ", 1)[1]  # remainder starts at field 3
+        starttime = rest.split()[19]  # so field 22 is at index 19
+        (self.logs / f"serve-{port}.pid").write_text(f"{p.pid} {starttime}\n")
+
+    def run_stats(self, *args):
+        env = {
+            "PATH": f"{self.stub_bin}{os.pathsep}{os.environ['PATH']}",
+            "HOME": str(self.tmp / "home"),
+            "LOG_DIR": str(self.logs),
+        }
+        out = subprocess.run(
+            [str(self.bin / "llm-serve"), "--stats", *args],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout.split()
+
+    def test_discovers_every_pid_file_server_in_order(self):
+        self.fake_server(9101)
+        self.fake_server(9102)
+        self.assertEqual(self.run_stats(), ["--port", "9101", "--port", "9102"])
+
+    def test_no_servers_falls_back_to_default_port(self):
+        self.assertEqual(self.run_stats(), ["--port", "8000"])
+
+    def test_single_port_flag_skips_discovery(self):
+        self.fake_server(9101)
+        self.fake_server(9102)
+        self.assertEqual(self.run_stats("--port", "9000"), ["--port", "9000"])
+
+    def test_every_port_flag_is_passed_on(self):
+        self.fake_server(9101)
+        self.assertEqual(
+            self.run_stats("--port", "9000", "--port=9001"),
+            ["--port", "9000", "--port", "9001"],
+        )
+
+    def test_extra_args_follow_the_ports(self):
+        self.fake_server(9101)
+        self.assertEqual(self.run_stats("--once"), ["--port", "9101", "--once"])
+
+
 if __name__ == "__main__":
     unittest.main()

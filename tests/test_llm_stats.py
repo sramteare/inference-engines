@@ -4,9 +4,13 @@ import io
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -1285,6 +1289,285 @@ class LlmStatsMayaCtxTest(unittest.TestCase):
 
     def test_used_clamps_to_context(self):
         self.assertIn("ctx  524288/524288", self.slot(live={**LIVE, "prompt_tokens": 600000}))
+
+
+NVIDIA_GPU_STUB = r"""#!/bin/sh
+case "$*" in
+  *compute-apps*) [ -f "__APPS__" ] || exit 1; cat "__APPS__"; exit 0;;
+  *uuid*)         [ -f "__UUIDS__" ] || exit 1; cat "__UUIDS__"; exit 0;;
+  *utilization*)  [ -f "__GPUS__" ] || exit 1; cat "__GPUS__"; exit 0;;
+esac
+exit 1
+"""
+
+SS_STUB = r"""#!/bin/sh
+[ -f "__SS__" ] || exit 1
+cat "__SS__"
+"""
+
+
+class LlmStatsGpuTest(unittest.TestCase):
+    """The dashboard's GPU lines on a two-card box: the cards the server on --port actually holds.
+    Stub nvidia-smi and ss sit first on PATH; /proc is a fake tree under LLM_STATS_PROC."""
+    GPUS_CSV = ("0, 10, 1234, 97887, 60.5, 41\n"
+                "1, 99, 89498, 97887, 300.2, 61\n")
+    UUIDS_CSV = "0, GPU-AAAA\n1, GPU-BBBB\n"
+    CARD1 = "GPU 1  99%  VRAM  87.4/95.6 GiB    300 W  61 C"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="llm-stats-gpu-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.stub = self.tmp / "stub"
+        self.stub.mkdir()
+        self.apps = self.stub / "apps.csv"
+        self.gpus = self.stub / "gpus.csv"
+        self.uuids = self.stub / "uuids.csv"
+        self.ssout = self.stub / "ss.out"
+        nvidia = self.stub / "nvidia-smi"
+        nvidia.write_text(NVIDIA_GPU_STUB.replace("__APPS__", str(self.apps))
+                                   .replace("__UUIDS__", str(self.uuids))
+                                   .replace("__GPUS__", str(self.gpus)))
+        nvidia.chmod(0o755)
+        ss = self.stub / "ss"
+        ss.write_text(SS_STUB.replace("__SS__", str(self.ssout)))
+        ss.chmod(0o755)
+        self.gpus.write_text(self.GPUS_CSV)
+        self.uuids.write_text(self.UUIDS_CSV)
+        self.proc = self.tmp / "proc"
+
+    def fake_proc(self, procs):
+        """A fake /proc tree: procs maps pid -> (ppid, session). The comm field holds spaces and parens,
+        so the parser has to cut at the last ")" like the real /proc one does."""
+        shutil.rmtree(self.proc, ignore_errors=True)
+        for pid, (ppid, sid) in procs.items():
+            d = self.proc / str(pid)
+            d.mkdir(parents=True)
+            (d / "stat").write_text(f"{pid} (fake (weird) server) S {ppid} {ppid} {sid} 0 0\n")
+
+    def listen(self, pid):
+        self.ssout.write_text(f'LISTEN 0 128 127.0.0.1:9 0.0.0.0:* users:(("llama-server",pid={pid},fd=6))\n')
+
+    def serve(self):
+        server = HTTPServer(("127.0.0.1", 0), LlamaCppHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def run_dash(self, port, *args):
+        env = {**ENV, "PATH": f"{self.stub}{os.pathsep}{os.environ['PATH']}",
+               "LLM_STATS_PROC": str(self.proc)}
+        return subprocess.run([sys.executable, str(SCRIPT), "--once", "--host", "127.0.0.1",
+                               "--port", str(port), *args], capture_output=True, text=True,
+                              timeout=30, env=env)
+
+    def gpu_lines(self, stdout):
+        return [ln for ln in stdout.splitlines() if ln.startswith("GPU")]
+
+    def test_server_holding_card_one_shows_only_card_one(self):
+        self.fake_proc({4000: (1, 4000), 4001: (4000, 4000)})   # the listener leads the session
+        self.apps.write_text("4001, GPU-BBBB\n")
+        port = self.serve()
+        self.listen(4000)
+        out = self.run_dash(port)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gpu_lines(out.stdout), [self.CARD1])
+        self.assertNotIn("GPU 0", out.stdout)
+
+    def test_server_holding_both_cards_shows_both(self):
+        self.fake_proc({4000: (1, 4000), 4001: (4000, 4000)})
+        self.apps.write_text("4001, GPU-BBBB\n4000, GPU-AAAA\n")
+        port = self.serve()
+        self.listen(4000)
+        out = self.run_dash(port)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual([ln.split()[1] for ln in self.gpu_lines(out.stdout)], ["0", "1"])
+
+    def test_holder_found_through_ppid_when_listener_is_not_the_leader(self):
+        # the listener 4200 belongs to session 4000 led by 4100, which holds GPU 0: only the listener's own
+        # subtree counts, so the session mate's card stays hidden and the listener's child's card shows
+        self.fake_proc({4100: (1, 4000), 4200: (4100, 4000), 4201: (4200, 4000)})
+        self.apps.write_text("4100, GPU-AAAA\n4201, GPU-BBBB\n")
+        port = self.serve()
+        self.listen(4200)
+        out = self.run_dash(port)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gpu_lines(out.stdout), [self.CARD1])
+
+    def test_no_holding_process_falls_back_to_every_card(self):
+        self.fake_proc({4000: (1, 4000)})
+        self.apps.write_text("9999, GPU-BBBB\n")   # a compute app that is not this server
+        port = self.serve()
+        self.listen(4000)
+        out = self.run_dash(port)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual([ln.split()[1] for ln in self.gpu_lines(out.stdout)], ["0", "1"])
+
+    def test_gpus_all_shows_every_card_whatever_the_holder(self):
+        self.fake_proc({4000: (1, 4000)})
+        self.apps.write_text("4000, GPU-BBBB\n")
+        port = self.serve()
+        self.listen(4000)
+        out = self.run_dash(port, "--gpus", "all")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual([ln.split()[1] for ln in self.gpu_lines(out.stdout)], ["0", "1"])
+
+    def test_gpus_list_shows_only_that_card(self):
+        self.fake_proc({4000: (1, 4000)})
+        self.apps.write_text("4000, GPU-BBBB\n")
+        port = self.serve()
+        self.listen(4000)
+        out = self.run_dash(port, "--gpus", "0")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual([ln.split()[1] for ln in self.gpu_lines(out.stdout)], ["0"])
+        out = self.run_dash(port, "--gpus", "0,1")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual([ln.split()[1] for ln in self.gpu_lines(out.stdout)], ["0", "1"])
+
+    def test_nvidia_smi_failure_shows_na(self):
+        self.fake_proc({4000: (1, 4000)})
+        self.apps.write_text("4000, GPU-BBBB\n")
+        self.gpus.unlink()   # the stub exits 1 for the stats query, like a failing nvidia-smi
+        port = self.serve()
+        self.listen(4000)
+        out = self.run_dash(port)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gpu_lines(out.stdout), ["GPU n/a"])
+
+    def test_bad_gpus_value_exits_with_an_argparse_error(self):
+        port = self.serve()
+        out = self.run_dash(port, "--gpus", "x")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("--gpus", out.stderr)
+
+
+MULTI_NVIDIA_STUB = r"""#!/bin/sh
+case "$*" in
+  *utilization*) cat "__GPUS__"; exit 0;;
+esac
+exit 1
+"""
+
+
+class LlmStatsMultiPortTest(unittest.TestCase):
+    """Several --port targets on one screen: one block per port in the order given, one blank line
+    between the blocks, the footer once at the end. --gpus all plus a stub nvidia-smi printing a
+    fixed CSV keep the real machine's GPU output out of every assertion."""
+    GPUS_CSV = ("0, 10, 1234, 97887, 60.5, 41\n"
+                "1, 99, 89498, 97887, 300.2, 61\n")
+    FOOTER = "last = most recent request, avg = since server start. Ctrl+C to exit."
+    CLEAR = "\033[H\033[2J"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="llm-stats-multi-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.stub = self.tmp / "stub"
+        self.stub.mkdir()
+        gpus = self.stub / "gpus.csv"
+        gpus.write_text(self.GPUS_CSV)
+        nvidia = self.stub / "nvidia-smi"
+        nvidia.write_text(MULTI_NVIDIA_STUB.replace("__GPUS__", str(gpus)))
+        nvidia.chmod(0o755)
+        self.env = {**ENV, "PATH": f"{self.stub}{os.pathsep}{os.environ['PATH']}"}
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = self.env["PATH"]   # the in-process render() below reaches nvidia-smi too
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+
+    def serve(self):
+        server = serve(LlamaCppHandler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    @staticmethod
+    def dead_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    def run_stats(self, *ports):
+        args = [sys.executable, str(SCRIPT), "--once", "--host", "127.0.0.1", "--gpus", "all"]
+        for port in ports:
+            args += ["--port", str(port)]
+        return subprocess.run(args, capture_output=True, text=True, timeout=30, env=self.env)
+
+    def test_two_ports_render_one_block_each_in_the_order_given(self):
+        pa, pb = self.serve(), self.serve()
+        out = self.run_stats(pb, pa)   # the order given on the command line, whatever the port numbers
+        self.assertEqual(out.returncode, 0, out.stderr)
+        lines = out.stdout.splitlines()
+        ib = next(i for i, ln in enumerate(lines) if f"http://127.0.0.1:{pb}   model" in ln)
+        ia = next(i for i, ln in enumerate(lines) if f"http://127.0.0.1:{pa}   model" in ln)
+        self.assertLess(ib, ia)
+        self.assertEqual(ib, 0)                          # the first block starts the output
+        self.assertEqual(lines[ia - 1], "")              # one blank line separates the blocks
+        self.assertNotEqual(lines[ia - 2], "")           # ... and only one
+        self.assertEqual(len([ln for ln in lines if ln.startswith("Prefill")]), 2)
+        self.assertEqual(out.stdout.count("GPU 0 "), 2)   # every block keeps its own GPU lines
+        self.assertEqual(out.stdout.count("Ctrl+C to exit."), 1)   # the footer once, at the very end
+        self.assertEqual(lines[-1], self.FOOTER)
+
+    def test_unreachable_port_gets_its_own_block(self):
+        port, dead = self.serve(), self.dead_port()
+        for first, second in ((dead, port), (port, dead)):   # the dead port first, and last
+            out = self.run_stats(first, second)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            lines = out.stdout.splitlines()
+            at = {v: next(i for i, ln in enumerate(lines)
+                          if ln.startswith(f"Cannot reach http://127.0.0.1:{v}")
+                          or f"http://127.0.0.1:{v}   model" in ln)
+                  for v in (port, dead)}
+            self.assertLess(at[first], at[second])           # blocks keep the order given
+            self.assertIn(f"Cannot reach http://127.0.0.1:{dead}", out.stdout)
+            self.assertIn(f"http://127.0.0.1:{port}   model", out.stdout)   # the other keeps rendering
+            self.assertEqual(out.stdout.count("Ctrl+C to exit."), 1)
+            self.assertEqual(lines[-1], self.FOOTER)
+
+    def test_repeated_port_renders_once(self):
+        port = self.serve()
+        twice = self.run_stats(port, port)
+        once = self.run_stats(port)
+        self.assertEqual(twice.returncode, 0, twice.stderr)
+        self.assertEqual(once.stdout.count("Prefill"), 1)
+        self.assertEqual(twice.stdout, once.stdout)   # deduplicated, the same single block
+
+    def test_single_port_output_is_render_output(self):
+        # one --port: byte-identical to what render() (the pre-multi-port path) prints directly
+        port = self.serve()
+        out = self.run_stats(port)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("llm_stats_multi_single", str(SCRIPT))
+        mod = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("llm_stats_multi_single", loader))
+        loader.exec_module(mod)
+        mod.configure(mod.p.parse_args(["--host", "127.0.0.1", "--gpus", "all", "--port", str(port)]))
+        self.assertEqual(out.stdout, mod.render() + "\n")
+
+    def test_live_mode_clears_once_per_frame_for_the_whole_set(self):
+        pa, pb = self.serve(), self.serve()
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), "--host", "127.0.0.1",
+                                 "--gpus", "all", "--interval", "0.2",
+                                 "--port", str(pa), "--port", str(pb)],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, env=self.env)
+        try:
+            data = ""
+            deadline = time.monotonic() + 30
+            while data.count(self.CLEAR) < 2 and time.monotonic() < deadline:
+                data += proc.stdout.read(4096)
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+        self.assertGreaterEqual(data.count(self.CLEAR), 2, "no second live frame arrived")
+        first, _, rest = data.partition(self.CLEAR)
+        frame1, _, _ = rest.partition(self.CLEAR)
+        self.assertEqual(first, "")   # a frame starts with the clear, not with a block
+        self.assertNotIn(self.CLEAR, frame1)   # one clear per frame, not one per block
+        self.assertEqual(frame1.count("Ctrl+C to exit."), 1)
+        self.assertIn(f"http://127.0.0.1:{pa}   model", frame1)
+        self.assertIn(f"http://127.0.0.1:{pb}   model", frame1)
 
 
 if __name__ == "__main__":
