@@ -27,7 +27,7 @@ done
 
 ## Expert-cache refill: `bench/gpulinks.cu --blob 11 --total 4096 --ring 1024`
 
-These are copies of 11 MiB each, the size of one expert. The refill line is for DeepSeek's 61.19 GiB set of fixed experts on a card. This run is after the fix that sets each card's id in blob mode. Before it, the 4-stream, both-at-once and peer lines ran with the wrong card selected, but they gave the same numbers. GPU 1 was 26% busy with other work when the run started.
+These are copies of 11 MiB each, the size of one expert. The destination is a 1 GiB ring that copies overwrite without waiting for each other, so the data is garbage and only the speed means anything. The refill line is for DeepSeek's 61.19 GiB set of fixed experts on a card. This run is after the fix that sets each card's id in blob mode. Before it, the 4-stream, both-at-once and peer lines ran with the wrong card selected, but they gave the same numbers. GPU 1 was 26% busy with other work when the run started.
 
 ```
 blob mode: 11 MiB blobs x 372 copies = 4092 MiB per run, ring 1024 MiB
@@ -84,4 +84,4 @@ step sess turn  out  hit%   pcie%  lookups
   11  B     5  1000   44.9    0.0  230683
 ```
 
-With the slots frozen, code does much better than Chinese, so the fixed set suits code. (The 132 fixed and 28 adaptive experts per layer come from the engine log's "VRAM expert tier 160 of 384 experts per layer (132 beside the prompt workspaces)" line and Basalt's `src/core/expert_tier.cpp`, not from this output.) The adaptive slots lift both sessions to 92–97%. A switch costs little: B's first request reached 95.2%, and A's first request after each switch back reached 92–93%, against 92–95% for A otherwise. The counts are per request, so they don't show how fast the cache adapts within one.
+With the slots frozen, this code session did far better than this Chinese session, so the fixed set suited code here (one pair of sessions, not a general test). (The 132 fixed and 28 adaptive experts per layer come from the engine log's "VRAM expert tier 160 of 384 experts per layer (132 beside the prompt workspaces)" line and Basalt's `src/core/expert_tier.cpp`, not from this output.) The adaptive slots lift both sessions to 92–97%. A switch costs little: B's first request reached 95.2%, and A's first request after each switch back reached 92–93%, against 92–95% for A otherwise. The counts are per request, so they don't show how fast the cache adapts within one.
