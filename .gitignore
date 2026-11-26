@@ -8,3 +8,6 @@
 __pycache__/
 *.pyc
 *.bak-*
+
+# Built from bench/gpulinks.cu
+/bench/gpulinks
