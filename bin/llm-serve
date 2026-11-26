@@ -123,6 +123,7 @@ main() {
   LOG_DIR="${LOG_DIR:-$ENGINES/logs}"
   HOST_SET="${HOST+1}"
   HOST="${HOST:-0.0.0.0}"
+  PORT_SET="${PORT+1}"
   PORT="${PORT:-8000}"
   SPEC="${SPEC:-1}"
   VISION="${VISION:-dynamic}"
@@ -510,10 +511,13 @@ EOF
       ;;
     --stats|stats)
       # Every running server on one screen, or exactly the --port N(s) given
-      # (repeatable). Extra args go to llm-stats.
+      # (repeatable). Extra args go to llm-stats. No discovery when --port is
+      # given, when PORT is set in the environment, or when --host names a
+      # remote machine (local ports mean nothing on another machine).
       shift
       local p
       local -a REST=() PORT_ARGS=()
+      local REMOTE_HOST=0
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --port)
@@ -521,11 +525,27 @@ EOF
             if [[ $# -gt 0 ]]; then PORT_ARGS+=(--port "$1"); shift; fi
             ;;
           --port=*) PORT_ARGS+=(--port "${1#--port=}"); shift ;;
+          --host)
+            if [[ $# -gt 1 ]]; then
+              case "$2" in
+                localhost|127.0.0.1|::1|0.0.0.0) ;;
+                *) REMOTE_HOST=1 ;;
+              esac
+            fi
+            REST+=("$1"); shift
+            ;;
+          --host=*)
+            case "${1#--host=}" in
+              localhost|127.0.0.1|::1|0.0.0.0) ;;
+              *) REMOTE_HOST=1 ;;
+            esac
+            REST+=("$1"); shift
+            ;;
           *) REST+=("$1"); shift ;;
         esac
       done
       local -a TARGETS=() PORTS=() CMDS=()
-      if (( ${#PORT_ARGS[@]} == 0 )); then
+      if (( ${#PORT_ARGS[@]} == 0 )) && [[ -z "$PORT_SET" ]] && (( ! REMOTE_HOST )); then
         find_servers
         for p in "${PORTS[@]}"; do PORT_ARGS+=(--port "$p"); done
       fi

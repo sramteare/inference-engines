@@ -1355,12 +1355,14 @@ class LlmServeStatsTest(unittest.TestCase):
         starttime = rest.split()[19]  # so field 22 is at index 19
         (self.logs / f"serve-{port}.pid").write_text(f"{p.pid} {starttime}\n")
 
-    def run_stats(self, *args):
+    def run_stats(self, *args, extra_env=None):
         env = {
             "PATH": f"{self.stub_bin}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(self.tmp / "home"),
             "LOG_DIR": str(self.logs),
         }
+        if extra_env:
+            env.update(extra_env)
         out = subprocess.run(
             [str(self.bin / "llm-serve"), "--stats", *args],
             capture_output=True,
@@ -1394,6 +1396,30 @@ class LlmServeStatsTest(unittest.TestCase):
     def test_extra_args_follow_the_ports(self):
         self.fake_server(9101)
         self.assertEqual(self.run_stats("--once"), ["--port", "9101", "--once"])
+
+    def test_remote_host_skips_discovery(self):
+        self.fake_server(9101)
+        self.fake_server(9102)
+        self.assertEqual(
+            self.run_stats("--host", "10.0.0.5"),
+            ["--port", "8000", "--host", "10.0.0.5"],
+        )
+
+    def test_local_host_still_discovers(self):
+        self.fake_server(9101)
+        self.fake_server(9102)
+        self.assertEqual(
+            self.run_stats("--host", "127.0.0.1"),
+            ["--port", "9101", "--port", "9102", "--host", "127.0.0.1"],
+        )
+
+    def test_env_port_skips_discovery(self):
+        self.fake_server(9101)
+        self.fake_server(9102)
+        self.assertEqual(
+            self.run_stats(extra_env={"PORT": "9200"}),
+            ["--port", "9200"],
+        )
 
 
 if __name__ == "__main__":
