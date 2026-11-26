@@ -27,6 +27,7 @@ TASKS = (
 )
 
 DONE_RE = re.compile(r"\bs(\d+)\s+done\b")
+READ_RE = re.compile(r"\]\s*s(\d+)\s+read\s")
 PP_RE = re.compile(r"\bpp=(\d+)/(\d+)c\b")
 TG_RE = re.compile(r"\btg=(\d+)\s+([\d.]+)t/s")
 ACC_RE = re.compile(r"\bacc=([\d.]+)%")
@@ -139,27 +140,30 @@ def tail_lines(path, count=3):
 
 
 def log_is_busy(path):
-    tail = tail_lines(path)
-    last_live = last_done = None
+    tail = tail_lines(path, 50)
+    last_done = last_busy = None
     for i, ln in enumerate(tail):
         if DONE_RE.search(ln):
             last_done = i
-        elif " live | " in ln:
-            last_live = i
-    return last_live is not None and (last_done is None or last_done < last_live)
+        elif " live | " in ln or READ_RE.search(ln):
+            last_busy = i
+    return last_busy is not None and (last_done is None or last_done < last_busy)
 
 
-def wait_until_idle(target):
-    announced = False
+def wait_until_idle(targets):
     deadline = time.monotonic() + IDLE_WAIT_S
-    while log_is_busy(target.log):
-        if not announced:
-            print(f"waiting for {target.port} to go idle", flush=True)
-            announced = True
+    announced = set()
+    while True:
+        busy = [t for t in targets if log_is_busy(t.log)]
+        if not busy:
+            return
         if time.monotonic() >= deadline:
-            raise SystemExit(
-                f"error: {target.port} never went idle within {IDLE_WAIT_S:g} s"
-            )
+            ports = ", ".join(str(t.port) for t in busy)
+            raise SystemExit(f"error: {ports} never went idle within {IDLE_WAIT_S:g} s")
+        for t in busy:
+            if t.port not in announced:
+                print(f"waiting for {t.port} to go idle", flush=True)
+                announced.add(t.port)
         time.sleep(IDLE_POLL_S)
 
 
@@ -246,8 +250,7 @@ def fmt_request(port, d):
 
 
 def run_round(rnum, targets, sessions, prompts, args):
-    for t in targets:
-        wait_until_idle(t)
+    wait_until_idle(targets)
     offsets = []
     reasons = []
     for t in targets:
@@ -390,17 +393,44 @@ def run_round(rnum, targets, sessions, prompts, args):
             rec["valid"] = False
             rec["invalid_reasons"].append(msg)
         if not errs:
-            tgs = [d["generated_tokens"] for d in dones]
-            for res in tresp:
-                if res["completion_tokens"] not in tgs:
+            if any(res["prompt_tokens"] is None for res in tresp) or any(
+                d["prompt_tokens"] is None or d["generated_tokens"] is None
+                for d in dones
+            ):
+                msg = (
+                    f"round {rnum}: INVALID on {t.port}: missing token counts, "
+                    "cannot match done lines to requests"
+                )
+                print(msg, flush=True)
+                rec["valid"] = False
+                rec["invalid_reasons"].append(msg)
+            else:
+                sent = sorted(
+                    (res["prompt_tokens"], res["completion_tokens"]) for res in tresp
+                )
+                logged = sorted(
+                    (d["prompt_tokens"], d["generated_tokens"]) for d in dones
+                )
+                if sent != logged:
                     msg = (
-                        f"round {rnum}: INVALID on {t.port}: response "
-                        f"completion_tokens {res['completion_tokens']} of session "
-                        f"s{res['session']} matches no done tg {tgs}"
+                        f"round {rnum}: INTERFERENCE on {t.port}: done lines do "
+                        f"not match the requests sent (sent {sent}, log {logged})"
                     )
                     print(msg, flush=True)
+                    trec["interference"] = {"done_lines_mismatch": True}
                     rec["valid"] = False
                     rec["invalid_reasons"].append(msg)
+
+        n_slots = len({d["slot"] for d in dones})
+        if n_slots != t.count:
+            msg = (
+                f"round {rnum}: INTERFERENCE on {t.port}: done lines name "
+                f"{n_slots} distinct slots, expected {t.count}"
+            )
+            print(msg, flush=True)
+            trec["interference"] = {"distinct_done_slots": n_slots}
+            rec["valid"] = False
+            rec["invalid_reasons"].append(msg)
 
         if len(dones) == t.count:
             for d in dones:

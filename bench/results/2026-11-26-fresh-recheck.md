@@ -31,7 +31,7 @@ How the speeds were measured:
 What changed:
 - **Remote reads:** the slow "0 reads 1" figure from 2026-11-25 was load on GPU 0. On idle cards both directions run at 46–51 GB/s.
 - **DeepSeek, one session:** faster than the 105–112 tok/s noted on 2026-11-25, which was not saved with its raw output.
-- **Qwen:** on these fixed prompts one session runs at 225–260 tok/s with about 68% draft acceptance. Requests from real coding work in the server log ran at 116–495 tok/s (median 289), some of them alongside other sessions; the faster ones accept more drafts (about 77% against 69%). A second slot on the same card adds 18–29% in total. Adding a second card for a third session gives about +75% at 2k and +97% at 50k over two sessions on one card (median 556.5 against 318.5, and 538 against 273).
+- **Qwen:** on these fixed prompts one session runs at 225–260 tok/s with about 68% draft acceptance. In the same server's log (`llama-qwen.log` on 2026-11-26), the 691 requests from real coding work with at least 200 output tokens ran at 116–495 tok/s (median 291), some of them alongside other sessions. The faster half accepted more drafts (median 80% against 68%). A second slot on the same card adds 18–29% in total. Adding a second card for a third session gives about +75% at 2k and +97% at 50k over two sessions on one card (median 556.5 against 318.5, and 538 against 273).
 
 ## Links: `bench/gpulinks.cu --mib 1024`, then `--blob 11 --total 4096 --ring 1024`
 
@@ -80,7 +80,17 @@ blob peer 1->0             median    55.16 GB/s   best    55.46 GB/s   refill 61
 
 ## DeepSeek, one session: `loadtest.py --target 8001:LOG:deepseek-v4.1-flash:1`
 
-At startup the engine placed experts as "main card 131, second card 0, RAM 253, file 0". It reported the cards' share of the weights as 70.34 GiB, which includes a 2.41 GiB drafter on GPU 0, and a RAM expert tier of 117.3 GiB.
+At startup the engine log (Basalt's `engine.log`) said:
+
+```
+basalt loader: the cards' share is read (70.34 GiB in 11.5 s); RAM next
+basalt deepseek41: RAM expert tier 117.3 GiB (253 of 384 experts per layer) loaded in 23.7 s
+basalt deepseek41: VRAM expert tier 158 of 384 experts per layer (131 beside the prompt workspaces)
+basalt deepseek41: drafter on GPU 0: 2.41 GiB, 32 of 128 experts per stage, windows of at most 6 tokens (--spec 0: off)
+basalt deepseek41: expert homes of 384 per layer: main card 131, second card 0, RAM 253, file 0; main card copies 0
+```
+
+The server runs with only GPU 1 visible, so the engine's "GPU 0" is physical GPU 1, and all 70.34 GiB is on that card. The VRAM tier holds 158 experts per layer: the 131 fixed homes plus 27 adaptive slots, which hold copies of experts whose home is in RAM. So homes add up to 131 + 253 = 384.
 
 | Context | Round 1 | Round 2 | Round 3 | Hit rate |
 |---|---|---|---|---|
@@ -133,7 +143,7 @@ step sess turn  out  hit%   pcie%  lookups   tok/s
 
 ## DeepSeek with experts on SSD: `diag-tier-ram: 155`
 
-Capping RAM at 155 experts per layer gave "main card 131, second card 0, RAM 155, file 98" (71.9 GiB in RAM). Without the cap the same setup holds 253 in RAM and 0 on SSD.
+Capping RAM at 155 experts per layer gave "expert homes of 384 per layer: main card 131, second card 0, RAM 155, file 98" and "RAM expert tier 71.9 GiB (155 of 384 experts per layer)" in the engine log: 131 + 155 + 98 = 384. The VRAM tier again held 158 per layer, 27 of them adaptive copies. Without the cap the same setup holds 253 in RAM and 0 on SSD.
 
 | Context | Round 1 | Round 2 | Round 3 | Hit rate |
 |---|---|---|---|---|
