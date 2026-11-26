@@ -20,6 +20,7 @@ How the speeds were measured:
 | RAM to one card / to both at once | 57 / 94 GB/s | 57.0 / 91.8–94.7 GB/s |
 | Refilling 61.19 GiB of experts, one card / both | 1.2 s / 1.4 s | 1.2 s / 1.4 s |
 | DeepSeek, one session (2k / 50k context) | 105–112 tok/s (not in a results file) | 118–127 / 113–132 tok/s |
+| DeepSeek, one session on both cards | `basalt-bench` conv task, 16k prompt, GPU 0 as main: 121–130 tok/s, against 99–114 on one card | GPU 0 as main: 131–137 tok/s; GPU 1 as main: 126–145 (2k and 50k together), against 114–121 on one card in the same run |
 | DeepSeek hit rate, two sessions taking turns | 92–97% | 92.0–96.9% |
 | DeepSeek with the adaptive slots frozen: hit rate, code / prose | 70–74% / 40–48% | 70.4–74.1% / 40.4–47.1% |
 | Same, generation speed, code / prose | not measured | 44–86 / 22–35 tok/s |
@@ -98,6 +99,40 @@ The server runs with only GPU 1 visible, so the engine's "GPU 0" is physical GPU
 | 50k | 125.4 | 131.5 | 113.1 | 94.3–95.5% |
 
 Round 1 at each context processes the whole prompt; rounds 2 and 3 reuse it from the cache.
+
+## DeepSeek on one card against both cards
+
+This was measured later the same day, after a reboot, with Qwen stopped so that GPU 0 was free. Each setting was a fresh `llm-serve -d deepseek` on :8001 with the `GPUS` value shown, then `loadtest.py --target 8001:LOG:deepseek-v4.1-flash:1`, with the same prompts as above.
+
+An `rsync` to a new HDD ran the whole time. It wrote 280–295 MB/s to the HDD, and read 50–295 MB/s from the NVMe, from which the model also loads. The avg10 of the `full` line in `/proc/pressure/io` was 17–44%. Once the model is loaded, generation reads nothing from disk ("file 0" below).
+
+The one-card speeds fall within the earlier run's range (113.7–120.9 against 113.1–131.5 tok/s), but the 50k median is about 7% lower (116.2 against 125.4). So a small effect from the copy can't be ruled out. All three settings ran under the same copy, so the comparison between them holds.
+
+| `GPUS` | Expert homes per layer: cards / RAM | 2k: per round, tok/s | 50k: per round | Hit rate | Read over PCIe |
+|---|---|---|---|---|---|
+| `1` (one card) | 133 / 251 | 120.2, 120.9, 119.3 (median 120.2) | 120.6, 116.2, 113.7 (median 116.2) | 94.6–96.0% | 1.6–2.5% |
+| `0,1` (GPU 0 as main, the llm-serve default) | 196 / 188 | 131.1, 134.2, 136.1 (median 134.2) | 131.4, 137.1, 132.5 (median 132.5) | 96.3–99.9% | 23.4–27.3% |
+| `1,0` (GPU 1 as main) | 200 / 184 | 126.3, 143.6, 144.3 (median 143.6) | 140.8, 145.0, 134.9 (median 140.8) | 96.8–99.9% | 25.1–27.9% |
+
+From the engine log at startup:
+- `GPUS=0,1`: "expert homes of 384 per layer: main card 0, second card 196, RAM 188, file 0; main card copies 170". The cards' share was 100.48 GiB.
+- `GPUS=1,0`: "main card 0, second card 200, RAM 184, file 0; main card copies 165". The cards' share was 102.33 GiB.
+- `GPUS=1`: the VRAM tier grew to 160 per layer, which is the 133 homes plus 27 adaptive slots, as in the earlier run.
+
+What this means, from Basalt 0.5.6's source (`include/basalt/core/tier_policy.hpp` and `src/core/expert_tier.cpp`):
+- **Where the homes are:** with two cards, every home in VRAM is on the second card (196–200 per layer), and the rest are in RAM (184–188).
+- **What the main card holds:** copies of the most-used experts whose home is in RAM. An expert from RAM that misses twice within a short window is promoted into a main-card slot, and the least-used slot gives way.
+- **The second card's homes can move:** experts can also be moved onto the second card over time.
+
+The first round at each context reads the whole prompt; later rounds reuse it.
+
+- **Both cards are faster:** +12% at 2k and +14% at 50k with GPU 0 as main, and +19% and +21% with GPU 1 as main, by median.
+- **Why:** the server's `pcie=` share counts two things:
+  - experts that the second card holds and computes itself. Only the activations and result rows cross PCIe, not the expert weights.
+  - experts copied from RAM to a card.
+  With both cards, this share is 23–28%, most of it work done on the second card. Of the lookups left to the main card, 99.4–99.9% hit its copies. On one card the share is 1.6–2.5%, all of it RAM-to-card copies, and 4–5% of lookups miss.
+- **Which card leads:** GPU 1 as main was about 7% faster than GPU 0 as main. GPU 1 also drives the desktop. Why the order matters is not checked, and three rounds per setting is a small sample.
+- **The 2026-11-25 comparison** (99–114 against 121–130 tok/s in `2026-11-25-two-gpus.md`) came from `basalt-bench` with different prompts, so it does not compare directly with these numbers.
 
 ## DeepSeek hit rate, two sessions taking turns: `hitrate.py 8001 ENGINE_LOG AAABBBABABAB 1000`
 
