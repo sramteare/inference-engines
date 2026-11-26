@@ -1313,6 +1313,7 @@ class LlmStatsGpuTest(unittest.TestCase):
                 "1, 99, 89498, 97887, 300.2, 61\n")
     UUIDS_CSV = "0, GPU-AAAA\n1, GPU-BBBB\n"
     CARD1 = "GPU 1  99%  VRAM  87.4/95.6 GiB    300 W  61 C"
+    CARD0 = "GPU 0  10%  VRAM   1.2/95.6 GiB     60 W  41 C"
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="llm-stats-gpu-"))
@@ -1434,6 +1435,27 @@ class LlmStatsGpuTest(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self.gpu_lines(out.stdout), ["GPU n/a"])
 
+    def test_na_power_row_shows_dash_and_keeps_the_other_card(self):
+        # a row with "[N/A]" power is parsed on its own: its dash must not hide the card whose row is fine
+        self.gpus.write_text("0, 10, 1234, 97887, 60.5, 41\n"
+                             "1, 99, 89498, 97887, [N/A], 61\n")
+        port = self.serve()
+        out = self.run_dash(port, "--gpus", "0")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gpu_lines(out.stdout), [self.CARD0])   # the healthy card prints as it always did
+        out = self.run_dash(port, "--gpus", "all")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gpu_lines(out.stdout),
+                         [self.CARD0, "GPU 1  99%  VRAM  87.4/95.6 GiB      - W  61 C"])
+
+    def test_only_unusable_rows_shows_na(self):
+        # every row skipped: wrong field count, or an index that is not an integer
+        self.gpus.write_text("garbage\nbroken, row\nx, 1, 2, 3, 4, 5\n")
+        port = self.serve()
+        out = self.run_dash(port, "--gpus", "all")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.gpu_lines(out.stdout), ["GPU n/a"])
+
     def test_bad_gpus_value_exits_with_an_argparse_error(self):
         port = self.serve()
         out = self.run_dash(port, "--gpus", "x")
@@ -1456,6 +1478,7 @@ class LlmStatsMultiPortTest(unittest.TestCase):
     GPUS_CSV = ("0, 10, 1234, 97887, 60.5, 41\n"
                 "1, 99, 89498, 97887, 300.2, 61\n")
     FOOTER = "last = most recent request, avg = since server start. Ctrl+C to exit."
+    MAYA_FOOTER = "last = newest request, avg(N) = over the N listed. Ctrl+C to exit."
     CLEAR = "\033[H\033[2J"
 
     def setUp(self):
@@ -1568,6 +1591,46 @@ class LlmStatsMultiPortTest(unittest.TestCase):
         self.assertEqual(frame1.count("Ctrl+C to exit."), 1)
         self.assertIn(f"http://127.0.0.1:{pa}   model", frame1)
         self.assertIn(f"http://127.0.0.1:{pb}   model", frame1)
+
+    def serve_handler(self, handler, cls=HTTPServer):
+        server = cls(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def load_frames_module(self, *ports):
+        """The module in-process, frame() over every given port (--gpus all: the stub nvidia-smi answers)."""
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader("llm_stats_footer_frames", str(SCRIPT))
+        mod = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("llm_stats_footer_frames", loader))
+        loader.exec_module(mod)
+        args = []
+        for port in ports:
+            args += ["--port", str(port)]
+        mod.configure(mod.p.parse_args(["--host", "127.0.0.1", "--gpus", "all", *args]))
+        return mod
+
+    def test_frame_prints_every_distinct_footer_once(self):
+        # mixed engines on one screen: each engine's footer once, in the order first seen, at the end
+        basalt = self.serve_handler(BasaltHandler)
+        maya = self.serve_handler(MayaHandler, MayaServer)
+        frame = self.load_frames_module(basalt, maya).frame()
+        self.assertEqual(frame.splitlines()[-2:], [self.FOOTER, self.MAYA_FOOTER])
+        self.assertEqual(frame.count(self.FOOTER), 1)   # the block itself no longer carries it
+        self.assertEqual(frame.count(self.MAYA_FOOTER), 1)
+        frame = self.load_frames_module(maya, basalt).frame()   # order follows the blocks, not the engine
+        self.assertEqual(frame.splitlines()[-2:], [self.MAYA_FOOTER, self.FOOTER])
+        self.assertEqual(frame.count("Ctrl+C to exit."), 2)
+
+    def test_frame_prints_one_footer_for_two_same_engine_servers(self):
+        frame = self.load_frames_module(self.serve_handler(BasaltHandler),
+                                        self.serve_handler(BasaltHandler)).frame()
+        self.assertIn("Basalt @", frame)
+        self.assertEqual(frame.count("Ctrl+C to exit."), 1)
+        self.assertEqual(frame.splitlines()[-1], self.FOOTER)
 
 
 if __name__ == "__main__":
