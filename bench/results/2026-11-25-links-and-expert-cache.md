@@ -4,7 +4,7 @@ Two RTX PRO 6000 Blackwell Max-Q cards on PCIe 5.0 x16, with 2 channels of DDR5-
 
 ## Links: `bench/gpulinks.cu --mib 1024`
 
-Qwen on GPU 0 was serving a request during this run. That is the likely reason "0 reads 1" is half of "1 reads 0".
+Qwen on GPU 0 was serving a request during this run. That is a likely reason, not checked, for why "0 reads 1" is half of "1 reads 0".
 
 ```
 buffer: 1024 MiB per GPU; local-read and host-copy numbers are only meaningful when the buffer is bigger than the GPU L2 (~128 MB) and the CPU L3 (~64 MB), so use --mib 512 or more for those
@@ -27,16 +27,16 @@ done
 
 ## Expert-cache refill: `bench/gpulinks.cu --blob 11 --total 4096 --ring 1024`
 
-These are copies of 11 MiB each, the size of one expert. The refill line is for DeepSeek's 61.19 GiB set of fixed experts on a card.
+These are copies of 11 MiB each, the size of one expert. The refill line is for DeepSeek's 61.19 GiB set of fixed experts on a card. This run is after the fix that sets each card's id in blob mode. Before it, the 4-stream, both-at-once and peer lines ran with the wrong card selected, but they gave the same numbers. GPU 1 was 26% busy with other work when the run started.
 
 ```
 blob mode: 11 MiB blobs x 372 copies = 4092 MiB per run, ring 1024 MiB
 blob h2d gpu0              median    56.66 GB/s   best    56.67 GB/s   refill 61.19 GiB: 1.2 s
-blob h2d gpu1              median    56.67 GB/s   best    56.70 GB/s   refill 61.19 GiB: 1.2 s
-blob h2d gpu1 4 streams    median    56.39 GB/s   best    56.50 GB/s   refill 61.19 GiB: 1.2 s
-blob h2d both at once      median    93.85 GB/s   best    94.82 GB/s   refill 61.19 GiB/card at half total rate: 1.4 s
-blob peer 0->1             median    55.39 GB/s   best    55.56 GB/s   refill 61.19 GiB: 1.2 s
-blob peer 1->0             median    55.33 GB/s   best    55.41 GB/s   refill 61.19 GiB: 1.2 s
+blob h2d gpu1              median    56.64 GB/s   best    56.66 GB/s   refill 61.19 GiB: 1.2 s
+blob h2d gpu1 4 streams    median    56.54 GB/s   best    56.57 GB/s   refill 61.19 GiB: 1.2 s
+blob h2d both at once      median    95.35 GB/s   best    96.02 GB/s   refill 61.19 GiB/card at half total rate: 1.4 s
+blob peer 0->1             median    55.40 GB/s   best    55.54 GB/s   refill 61.19 GiB: 1.2 s
+blob peer 1->0             median    55.31 GB/s   best    55.51 GB/s   refill 61.19 GiB: 1.2 s
 done
 ```
 
@@ -44,7 +44,7 @@ done
 
 This run used DeepSeek V4.1 Flash (UD-Q2_K_XL) on GPU 1 alone, Basalt 0.5.6. Session A writes Python and session B writes Chinese prose, with 1,000 tokens per request.
 
-The hit rate is the share of routed experts found in VRAM, as Basalt counts it per request. pcie% is the share the GPU read over PCIe, which is not in the hit count.
+The hit rate is the share of routed experts found in VRAM, as Basalt counts it per request. pcie% is the share of all routed experts the GPU read over PCIe or from another GPU. Those are not in the hit count.
 
 Command: `bench/hitrate.py 8001 ~/.cache/basalt/<hash>/engine.log AAABBBABABAB 1000`
 
@@ -84,4 +84,4 @@ step sess turn  out  hit%   pcie%  lookups
   11  B     5  1000   44.9    0.0  230683
 ```
 
-The 132 fixed experts per layer are ranked once and suit code. The adaptive slots lift both sessions to 92–97%, and they adapt within one request after a switch.
+The 132 fixed experts per layer are ranked once and suit code. The adaptive slots lift both sessions to 92–97%, and the first request after a switch is already at 95%. The counts are per request, so they don't show how fast the cache adapts within one.

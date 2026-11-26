@@ -288,6 +288,7 @@ static int runBlobMode(long blob, long total, long ring) {
 
     Gpu g[2];
     for (int i = 0; i < 2; ++i) {
+        g[i].id = i;
         CUDA_CHECK(cudaSetDevice(i));
         CUDA_CHECK(cudaMalloc((void**)&g[i].buf, c.ringBytes));
         CUDA_CHECK(cudaMalloc((void**)&g[i].src, c.ringBytes));
