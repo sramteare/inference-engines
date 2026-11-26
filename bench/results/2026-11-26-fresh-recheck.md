@@ -1,11 +1,12 @@
 # Fresh re-check of the two-card numbers (2026-11-26)
 
-This is the same machine as [2026-11-25-links-and-expert-cache.md](2026-11-25-links-and-expert-cache.md): two RTX PRO 6000 Blackwell Max-Q cards on PCIe 5.0 x16, with 2 channels of DDR5-6400. Every number that the plan doc "Basalt: two cards as one pool" relies on was measured again here, with no other client using the servers. GPU 1 also drives the desktop, which adds 4–8% load. GB/s means 1e9 bytes per second.
+This is the same machine as [2026-11-25-links-and-expert-cache.md](2026-11-25-links-and-expert-cache.md): two RTX PRO 6000 Blackwell Max-Q cards on PCIe 5.0 x16, with 2 channels of DDR5-6400. Every number that the plan doc "Basalt: two cards as one pool" relies on was measured again here, with no other client using the servers. GPU 1 also drives the desktop; it was 21% and then 3% busy when the two link runs started. GB/s means 1e9 bytes per second.
 
 How the speeds were measured:
 - `bench/loadtest.py` reads every speed from the server's own `done` and `live` log lines, not from client timing.
-- It drops any round in which the log shows a different number of finished requests than it sent, which means another client used the server. No round was dropped in the runs below.
+- It drops any round in which the log shows a different number of finished requests than it sent, which usually means another client used the server. No round was dropped in the runs below.
 - Prompts are fixed: a system prompt of filler words (2k or 50k tokens, different for each session) plus one of three Python coding tasks. Each round gives 1,500 output tokens per session at temperature 0.6, over 3 rounds.
+- A round's total for a server is the median of the server's `live` total over the moments when all its sessions were generating. Each slot's live rate is that request's average so far, so the total leans slightly towards the slow start of each request. The pool total is the sum of those per-server totals in one round. The medians below are over rounds.
 - Qwen is Qwen3.8-Flash-Next on llm-serve's `qwen` profile, with `PARALLEL=2` on :8000. DeepSeek is DeepSeek-V4.1-Flash on Basalt 0.5.6.
 
 ## Summary
@@ -18,19 +19,19 @@ How the speeds were measured:
 | A card reading its own memory | 1,584–1,633 GB/s | 1,630–1,637 GB/s |
 | RAM to one card / to both at once | 57 / 94 GB/s | 57.0 / 91.8–94.7 GB/s |
 | Refilling 61.19 GiB of experts, one card / both | 1.2 s / 1.4 s | 1.2 s / 1.4 s |
-| DeepSeek, one session (2k / 50k context) | 105–112 tok/s | 118–127 / 113–132 tok/s |
+| DeepSeek, one session (2k / 50k context) | 105–112 tok/s (not in a results file) | 118–127 / 113–132 tok/s |
 | DeepSeek hit rate, two sessions taking turns | 92–97% | 92.0–96.9% |
 | DeepSeek with the adaptive slots frozen: hit rate, code / prose | 70–74% / 40–48% | 70.4–74.1% / 40.4–47.1% |
 | Same, generation speed, code / prose | not measured | 44–86 / 22–35 tok/s |
-| DeepSeek with 98 of 384 experts per layer on SSD | 53–89 tok/s, 69–84% hit | 66–91 tok/s (2k), 87–90 (50k); 80–90% hit |
-| Qwen, one session (2k / 50k) | not measured on fixed prompts | 225–260 (median 247) / 229–237 (median 232) tok/s |
-| Qwen, two sessions at once on one card, total (2k / 50k) | not measured on fixed prompts | 295–320 (median 319) / 206–282 (median 273) tok/s |
-| Qwen, three sessions over two cards, total (2k / 50k) | not measured | 556–592 (median 572) / 508–541 (median 526) tok/s |
+| DeepSeek with 98 of 384 experts per layer on SSD | 53–89 tok/s, 69–84% hit (not in a results file) | 66–91 tok/s (2k), 87–90 (50k); 80–90% hit |
+| Qwen, one session (2k / 50k) | not measured on fixed prompts | 225–260 (median 247) / 232–237 (median 233) tok/s per request |
+| Qwen, two sessions at once on one card, total (2k / 50k) | not measured on fixed prompts | 295–320 (median 318.5) / 206–282 (median 273) tok/s |
+| Qwen, three sessions over two cards, total (2k / 50k) | not measured | 556–592 (median 556.5) / 508–541 (median 538) tok/s |
 
 What changed:
 - **Remote reads:** the slow "0 reads 1" figure from 2026-11-25 was load on GPU 0. On idle cards both directions run at 46–51 GB/s.
-- **DeepSeek, one session:** about 10% faster than the 2026-11-25 figure.
-- **Qwen:** on these fixed prompts one session runs at 225–260 tok/s with about 68% draft acceptance. Real coding traffic runs at 250–495 tok/s alone, because it accepts more drafts. A second slot on the same card adds 18–29% in total, and a second card adds about 80–95% over one card.
+- **DeepSeek, one session:** faster than the 105–112 tok/s noted on 2026-11-25, which was not saved with its raw output.
+- **Qwen:** on these fixed prompts one session runs at 225–260 tok/s with about 68% draft acceptance. Requests from real coding work in the server log ran at 116–495 tok/s (median 289), some of them alongside other sessions; the faster ones accept more drafts (about 77% against 69%). A second slot on the same card adds 18–29% in total. Adding a second card for a third session gives about +75% at 2k and +97% at 50k over two sessions on one card (median 556.5 against 318.5, and 538 against 273).
 
 ## Links: `bench/gpulinks.cu --mib 1024`, then `--blob 11 --total 4096 --ring 1024`
 
@@ -79,7 +80,7 @@ blob peer 1->0             median    55.16 GB/s   best    55.46 GB/s   refill 61
 
 ## DeepSeek, one session: `loadtest.py --target 8001:LOG:deepseek-v4.1-flash:1`
 
-At startup the engine placed experts as "main card 131, second card 0, RAM 253, file 0". GPU 1 used 70.3 GiB, and the RAM expert tier was 125.9 GB.
+At startup the engine placed experts as "main card 131, second card 0, RAM 253, file 0". It reported the cards' share of the weights as 70.34 GiB, which includes a 2.41 GiB drafter on GPU 0, and a RAM expert tier of 117.3 GiB.
 
 | Context | Round 1 | Round 2 | Round 3 | Hit rate |
 |---|---|---|---|---|
@@ -158,7 +159,7 @@ This adds a second Qwen server on GPU 1: `GPUS=1 PORT=8002 LLM_SERVE_INSTANCE=gp
 
 | Context | :8000 total, by round | :8002, by round | Pool total, by round |
 |---|---|---|---|
-| 2k | 306, 322.5, 325.5 | 249.5, 269, 231 | 555.5, 591.5, 556.5 (median 572) |
-| 50k | 286.5, 309, 294 | 221, 232, 244 | 507.5, 541, 538 (median 526) |
+| 2k | 306, 322.5, 325.5 | 249.5, 269, 231 | 555.5, 591.5, 556.5 (median 556.5) |
+| 50k | 286.5, 309, 294 | 221, 232, 244 | 507.5, 541, 538 (median 538) |
 
-On the same prompts, one card's two-session total plus a lone session (319 + 247 = 566 at 2k) predicts the measured 572.
+The script printed "pool total 572" and "526" for these runs: that was the sum of each server's median, not the median over rounds, and it is fixed in this PR. On the same prompts, one card's two-session total plus a lone session (318.5 + 247 = 565.5 at 2k) is close to the measured median of 556.5.

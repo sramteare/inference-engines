@@ -215,12 +215,15 @@ def parse_done(line):
 
 def parse_live(line):
     slots = {}
+    slot_tg = {}
     for m in LIVE_SLOT_RE.finditer(line):
         slots["s" + m.group(1)] = float(m.group(4)) if m.group(4) else None
+        slot_tg["s" + m.group(1)] = int(m.group(2))
     tm = LIVE_TOTAL_RE.search(line)
     return {
         "raw": line.strip(),
         "slots": slots,
+        "slot_tg": slot_tg,
         "total": float(tm.group(1)) if tm else None,
     }
 
@@ -306,6 +309,21 @@ def run_round(rnum, targets, sessions, prompts, args):
             "live": None,
         }
 
+        try:
+            grew = os.path.getsize(t.log) > offsets[ti]
+        except OSError:
+            grew = False
+        if not grew:
+            msg = (
+                f"round {rnum}: INVALID on {t.port}: log {t.log} did not grow "
+                "during the round (wrong log file?)"
+            )
+            print(msg, flush=True)
+            rec["valid"] = False
+            rec["invalid_reasons"].append(msg)
+            rec["targets"].append(trec)
+            continue
+
         if len(dones) != t.count:
             msg = (
                 f"round {rnum}: INTERFERENCE on {t.port}: expected "
@@ -334,6 +352,26 @@ def run_round(rnum, targets, sessions, prompts, args):
             )
             print(msg, flush=True)
             trec["interference"] = {"live_intruder_slot": intruder}
+            rec["valid"] = False
+            rec["invalid_reasons"].append(msg)
+
+        prev_tg = {}
+        restart = None
+        for lv in lives:
+            for sl, tg in lv["slot_tg"].items():
+                if tg < prev_tg.get(sl, tg):
+                    restart = (sl, prev_tg[sl], tg)
+                    break
+                prev_tg[sl] = tg
+            if restart is not None:
+                break
+        if restart is not None:
+            msg = (
+                f"round {rnum}: INTERFERENCE on {t.port}: slot {restart[0]} "
+                f"restarted (tg went from {restart[1]} to {restart[2]})"
+            )
+            print(msg, flush=True)
+            trec["interference"] = {"slot_restarted": restart[0]}
             rec["valid"] = False
             rec["invalid_reasons"].append(msg)
 
@@ -389,7 +427,7 @@ def run_round(rnum, targets, sessions, prompts, args):
     for trec in rec["targets"]:
         if trec["interference"] is not None:
             parts.append(f"{trec['port']}: interference")
-        elif trec["live"]["total_median"] is not None:
+        elif trec["live"] and trec["live"]["total_median"] is not None:
             parts.append(
                 f"{trec['port']} all-generating total median "
                 f"{fmt(trec['live']['total_median'], 't/s')} "
@@ -445,6 +483,10 @@ def main(argv=None):
         targets = [Target(spec) for spec in args.target]
     except ValueError as exc:
         ap.error(str(exc))
+
+    for t in targets:
+        if not os.path.isfile(t.log):
+            raise SystemExit(f"error: log for {t.port} not found: {t.log}")
 
     sessions = []
     for ti, t in enumerate(targets):
@@ -516,15 +558,24 @@ def main(argv=None):
         print(f"  acc median: {fmt(entry['acc_median'], '%')}")
         print(f"  hit median: {fmt(entry['hit_median'], '%')}")
 
-    pool_total = (
+    pool_rounds = [rc["pool_total"] for rc in valid if rc["pool_total"] is not None]
+    pool_total = median(pool_rounds)
+    pool_total_min = min(pool_rounds) if pool_rounds else None
+    pool_total_max = max(pool_rounds) if pool_rounds else None
+    pool_sum_medians = (
         sum(pool_parts)
-        if all(v is not None for v in pool_parts) and pool_parts
+        if pool_parts and all(v is not None for v in pool_parts)
         else None
     )
     if pool_total is None:
         print("pool total: n/a")
     else:
-        print(f"pool total: {pool_total:g}t/s")
+        print(
+            f"pool total: median {pool_total:g}t/s, min-max "
+            f"{pool_total_min:g}-{pool_total_max:g}t/s ({len(pool_rounds)} rounds)"
+        )
+    if pool_sum_medians is not None:
+        print(f"sum of per-target medians: {pool_sum_medians:g}t/s")
 
     out = {
         "label": args.label,
@@ -541,6 +592,9 @@ def main(argv=None):
             "invalid_rounds": len(invalid),
             "targets": summary_targets,
             "pool_total": pool_total,
+            "pool_total_min": pool_total_min,
+            "pool_total_max": pool_total_max,
+            "pool_total_sum_of_target_medians": pool_sum_medians,
         },
     }
     if args.json_out:
