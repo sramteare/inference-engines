@@ -21,7 +21,7 @@ so its binaries are tuned to this CPU and GPU and are not portable.
 
 ```
 bin/llm-serve        start/stop/inspect llama-server profiles (qwen, deepseek)
-bin/llm-stats        live metrics dashboard for a running llama-server
+bin/llm-stats        live metrics dashboard for running llama-server(s), one block per --port
 bin/llm-bench        reproducible benchmark suite (cold, warm, long context, MoE cache)
 bin/llm-stop         stop llama-server instance(s)
 build-llama.sh       check out the pinned llama.cpp tag and build it natively

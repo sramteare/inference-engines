@@ -123,6 +123,7 @@ main() {
   LOG_DIR="${LOG_DIR:-$ENGINES/logs}"
   HOST_SET="${HOST+1}"
   HOST="${HOST:-0.0.0.0}"
+  PORT_SET="${PORT+1}"
   PORT="${PORT:-8000}"
   SPEC="${SPEC:-1}"
   VISION="${VISION:-dynamic}"
@@ -147,7 +148,7 @@ main() {
 Usage:
   llm-serve [-d] [profile] [extra llama-server args...]
   llm-serve --status [--port N]       One-shot server & GPU status snapshot
-  llm-serve --stats  [--port N ...]   Live terminal dashboard (Ctrl+C to exit)
+  llm-serve --stats  [--port N]       Live dashboard: every running server, or one with --port
   llm-serve --stop   [port]           Stop running server instance(s)
   llm-serve --list                    List available model profiles
   llm-serve -h | --help               Show this help message
@@ -165,7 +166,8 @@ Profiles:
 Flags / Subcommands:
   -d                Run server in background (logs to $LOG_DIR/llama-<profile>.log)
   --status, status  Print current server status and metrics snapshot (--once)
-  --stats,  stats   Launch live metrics dashboard (passes extra args to llm-stats)
+  --stats,  stats   Launch live metrics dashboard: every running server, or one with --port N
+                    (passes extra args to llm-stats)
   --stop,   stop    Stop running server(s): llama-server, Maya, Basalt (optionally filtered
                     by port). Pid files are verified (start time + cmdline) before anything
                     is signalled; servers are stopped by session, engine children included.
@@ -341,20 +343,15 @@ EOF
     fi
   }
 
-  do_status() {
-    # --port N filters the servers to show; everything else goes to llm-stats.
-    local port_filter=""
-    local -a REST=()
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --port)
-          shift
-          if [[ $# -gt 0 ]]; then port_filter="$1"; shift; fi
-          ;;
-        --port=*) port_filter="${1#--port=}"; shift ;;
-        *) REST+=("$1"); shift ;;
-      esac
-    done
+  # One entry per running server: pid files first (process groups), then any
+  # server found by its listening socket (no pid file, e.g. started in the
+  # foreground) that is not already covered by one of those groups.
+  # $1 (optional): a port: report only the servers listening on it.
+  # Appends one entry per server to the caller-declared TARGETS (pid/pgid),
+  # PORTS and CMDS arrays (bash dynamic scoping: the caller declares them local -a).
+  find_servers() {
+    local port_filter="${1:-}"
+    local group_pgids="" seen_pids="" f pgid starttime port pid cmd
 
     # Server pid plus the pids of its engine processes. Basalt runs bin/basalt
     # in its own group but in the server's session (setsid at launch), so list
@@ -372,11 +369,6 @@ EOF
       fi
     }
 
-    # One entry per running server: pid files first (process groups), then any
-    # server found by its listening socket (no pid file, e.g. started in the
-    # foreground) that is not already covered by one of those groups.
-    local -a TARGETS=() PORTS=() CMDS=()
-    local group_pgids="" seen_pids="" f pgid starttime port pid cmd
     for f in "$LOG_DIR"/serve-*.pid; do
       [[ -e "$f" ]] || continue
       pgid=""; starttime=""
@@ -410,6 +402,29 @@ EOF
     done < <(ss -ltnpH 2>/dev/null | awk '$1 == "LISTEN" && match($0, /pid=[0-9]+/) {
                 port = $4; sub(/.*:/, "", port); print port + 0, substr($0, RSTART + 4, RLENGTH - 4)
               }' | sort -n || true)
+  }
+
+  do_status() {
+    # --port N filters the servers to show; everything else goes to llm-stats.
+    local port_filter=""
+    local -a REST=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --port)
+          shift
+          if [[ $# -gt 0 ]]; then port_filter="$1"; shift; fi
+          ;;
+        --port=*) port_filter="${1#--port=}"; shift ;;
+        *) REST+=("$1"); shift ;;
+      esac
+    done
+
+    # Server discovery lives in find_servers: pid files first (process groups),
+    # then any server found by its listening socket (no pid file, e.g. started
+    # in the foreground) that is not already covered by one of those groups.
+    local -a TARGETS=() PORTS=() CMDS=()
+    local cmd
+    find_servers "$port_filter"
 
     if [[ ${#TARGETS[@]} -eq 0 ]]; then
       echo "No server running."
@@ -495,8 +510,48 @@ EOF
       return 0
       ;;
     --stats|stats)
+      # Every running server on one screen, or exactly the --port N(s) given
+      # (repeatable). Extra args go to llm-stats. No discovery when --port is
+      # given, when PORT is set in the environment, or when --host names a
+      # remote machine (local ports mean nothing on another machine).
       shift
-      exec "$ENGINES/bin/llm-stats" --port "$PORT" "$@"
+      local p
+      local -a REST=() PORT_ARGS=()
+      local REMOTE_HOST=0
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --port)
+            shift
+            if [[ $# -gt 0 ]]; then PORT_ARGS+=(--port "$1"); shift; fi
+            ;;
+          --port=*) PORT_ARGS+=(--port "${1#--port=}"); shift ;;
+          --host)
+            if [[ $# -gt 1 ]]; then
+              case "$2" in
+                localhost|127.0.0.1|::1|0.0.0.0) ;;
+                *) REMOTE_HOST=1 ;;
+              esac
+            fi
+            REST+=("$1"); shift
+            ;;
+          --host=*)
+            case "${1#--host=}" in
+              localhost|127.0.0.1|::1|0.0.0.0) ;;
+              *) REMOTE_HOST=1 ;;
+            esac
+            REST+=("$1"); shift
+            ;;
+          *) REST+=("$1"); shift ;;
+        esac
+      done
+      local -a TARGETS=() PORTS=() CMDS=()
+      if (( ${#PORT_ARGS[@]} == 0 )) && [[ -z "$PORT_SET" ]] && (( ! REMOTE_HOST )); then
+        find_servers
+        for p in "${PORTS[@]}"; do PORT_ARGS+=(--port "$p"); done
+      fi
+      # no --port and no server found: today's default single-port behaviour
+      if (( ${#PORT_ARGS[@]} == 0 )); then PORT_ARGS=(--port "$PORT"); fi
+      exec "$ENGINES/bin/llm-stats" "${PORT_ARGS[@]}" "${REST[@]}"
       ;;
   esac
 

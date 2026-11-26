@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
 """llm-stats - live dashboard for a running llama.cpp, Basalt or Maya server.
 
-Usage: llm-stats [--port 8000] [--host localhost] [--interval 1] [--once] [--engine auto]
+Usage: llm-stats [--port 8000] [--port 8001 ...] [--host localhost] [--interval 1] [--once] [--engine auto] [--gpus auto]
+--port may be repeated: every given port is its own block on one screen (blank line between, footer once at the end).
 --engine auto (default) detects the engine from /health and /v1/status, and re-detects if the server goes away or changes.
+--gpus auto (default) shows only the card(s) the server on --port holds (via ss, /proc and nvidia-smi, local --host only);
+all shows every card, and a comma list like 0 or 0,1 shows those cards.
 Requires llama-server started with --metrics (llm-serve does this).
 """
-import argparse, json, math, re, subprocess, sys, time, urllib.request
+import argparse, json, math, os, re, subprocess, sys, time, urllib.request
+
+
+def gpus_arg(s):
+    """--gpus value: "auto", "all", or a comma list of card indices like "0" or "0,1"."""
+    if s in ("auto", "all"):
+        return s
+    if re.fullmatch(r"\d+(,\d+)*", s):
+        return [int(x) for x in s.split(",")]
+    raise argparse.ArgumentTypeError(f"expected auto, all or a comma list like 0,1, got {s!r}")
+
 
 p = argparse.ArgumentParser()
 p.add_argument("--host", default="localhost")
-p.add_argument("--port", type=int, default=8000)
+p.add_argument("--port", type=int, action="append", default=None)   # repeatable; none given = 8000
 p.add_argument("--interval", type=float, default=1.0)
 p.add_argument("--once", action="store_true")
 p.add_argument("--engine", choices=["auto", "llamacpp", "basalt", "maya"], default="auto")
+p.add_argument("--gpus", type=gpus_arg, default="auto")
 # parse_args() must NOT run at module level: importing the module under e.g. sys.argv = ["pytest", "-q"]
 # would exit with an argparse error. main() parses and calls configure(); these are just safe defaults.
 BASE = "http://localhost:8000"
@@ -20,14 +34,42 @@ NAMES = {"llamacpp": "llama.cpp", "basalt": "Basalt", "maya": "Maya"}
 ENGINE = None                  # None = not detected yet (configure() sets it for --engine X)
 AUTO = True                    # only auto mode may re-detect the engine after start
 LAST_DETECT = 0.0              # monotonic time of the last detect() in auto mode
+GPU_OPTION = "auto"            # --gpus: "auto", "all" or a list of card indices
+GPU_CACHE, GPU_CACHE_AT = None, None   # auto mode: last server_gpus() result (None = every card) and its time
+HOST, PORT = "localhost", 8000  # parsed --host/--port: the auto-mode host check and the ss port
+PORTS = []                     # one state dict per --port target: configure() fills them, frame() renders each
+STATE_KEYS = ("BASE", "PORT", "ENGINE", "AUTO", "LAST_DETECT", "PREV", "GPU_CACHE", "GPU_CACHE_AT")
+
+
+def new_target(port, engine, auto):
+    """One target's per-port state: the globals render() works on, kept aside while another target renders."""
+    return {"BASE": f"http://{HOST}:{port}", "PORT": port, "ENGINE": engine, "AUTO": auto,
+            "LAST_DETECT": 0.0, "PREV": {}, "GPU_CACHE": None, "GPU_CACHE_AT": None}
+
+
+def _load(st):
+    """Swap one target's state into the globals render() reads and writes."""
+    globals().update(st)
+
+
+def _store(st):
+    """Save the globals back into the target they were loaded from (PREV mutates its dict in place)."""
+    st.update({k: globals()[k] for k in STATE_KEYS})
 
 
 def configure(a):
-    """Apply parsed options to the module globals; called by main() when run as a script."""
-    global BASE, ENGINE, AUTO
-    BASE = f"http://{a.host}:{a.port}"
-    ENGINE = None if a.engine == "auto" else a.engine
-    AUTO = a.engine == "auto"
+    """Apply parsed options to the module globals; called by main() when run as a script.
+    Every --port gets its own state dict; the globals then hold the first target's state."""
+    global HOST, GPU_OPTION, PORTS
+    HOST, GPU_OPTION = a.host, a.gpus
+    engine = None if a.engine == "auto" else a.engine
+    auto = a.engine == "auto"
+    targets = []
+    for port in a.port or [8000]:   # --port repeatable; deduplicate, keep the order given
+        if not any(t["PORT"] == port for t in targets):
+            targets.append(new_target(port, engine, auto))
+    PORTS = targets
+    _load(targets[0])
 
 
 def get(path, as_json=True, timeout=2):
@@ -130,15 +172,123 @@ def server_info():
     return model, ctx
 
 
-def gpu():
+def gpu(indices=None):
+    """One line per card whose index is in indices (None, or no match, = every card). A row is skipped when its
+    index is not an integer or it has other than exactly 6 fields; in a usable row a field that is not a number
+    shows as "-" in the column width a number would have. "GPU n/a" when nvidia-smi fails, is missing or times
+    out, or when no row is usable."""
+    def cell(s, spec, dash, scale=1):   # a field as a number, or the dash padded to that column's width
+        try:
+            return format(float(s) / scale, spec)
+        except ValueError:
+            return dash
     try:
         q = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3).stdout.strip()
-        u, mu, mt, pw, t = [x.strip() for x in q.splitlines()[0].split(",")]
-        return f"GPU {u:>3}%  VRAM {float(mu)/1024:5.1f}/{float(mt)/1024:.1f} GiB  {float(pw):5.0f} W  {t} C"
+        rows = []
+        for line in q.splitlines():
+            fields = [x.strip() for x in line.split(",")]
+            if len(fields) != 6:
+                continue
+            try:
+                idx = int(fields[0])
+            except ValueError:
+                continue
+            try:
+                float(fields[1])
+                u = f"{fields[1]:>3}"   # utilization keeps its raw token, right-aligned like always
+            except ValueError:
+                u = "  -"
+            mu = cell(fields[2], "5.1f", "    -", 1024)
+            mt = cell(fields[3], ".1f", "-", 1024)
+            pw = cell(fields[4], "5.0f", "    -")
+            rows.append((idx, f"GPU {idx} {u}%  VRAM {mu}/{mt} GiB  {pw} W  {fields[5]} C"))
+        if not rows:
+            raise ValueError("no parsable nvidia-smi line")
+        if indices:
+            hit = [ln for i, ln in rows if i in indices]
+            if hit:
+                return "\n".join(hit)
+        return "\n".join(ln for _, ln in rows)
     except Exception:
         return "GPU n/a"
+
+
+def _proc_stat(proc_root, pid):
+    """(ppid, session) from <proc_root>/<pid>/stat, parsed after the last ")" (comm may hold spaces and parens)."""
+    with open(os.path.join(proc_root, str(pid), "stat")) as f:
+        rest = f.read().rsplit(")", 1)[1].split()
+    return int(rest[1]), int(rest[3])
+
+
+def _server_pids(proc_root, pid):
+    """The server's processes: the whole session when the listener leads it (session == pid), else listener + descendants."""
+    ppid_of, session_of = {}, {}
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        try:
+            ppid_of[int(name)], session_of[int(name)] = _proc_stat(proc_root, name)
+        except (OSError, IndexError, ValueError):
+            continue
+    if session_of.get(pid) == pid:
+        return {q for q, sid in session_of.items() if sid == pid}
+    pids, frontier = {pid}, [pid]
+    while frontier:
+        cur = frontier.pop()
+        kids = [q for q, pp in ppid_of.items() if pp == cur and q not in pids]
+        pids.update(kids)
+        frontier += kids
+    return pids
+
+
+def server_gpus(port):
+    """Sorted GPU indices held by the server processes listening on `port`, None when it cannot tell;
+    LLM_STATS_PROC overrides the root of /proc so tests can use a fake tree."""
+    try:
+        out = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"],
+                             capture_output=True, text=True, timeout=3).stdout
+        m = re.search(r"pid=(\d+)", out)
+        if not m:
+            return None
+        pids = _server_pids(os.environ.get("LLM_STATS_PROC", "/proc"), int(m.group(1)))
+        apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
+                              capture_output=True, text=True, timeout=3).stdout
+        uuids = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                               capture_output=True, text=True, timeout=3).stdout
+        idx_of = {}
+        for line in uuids.splitlines():
+            i, _, u = line.partition(",")
+            try:
+                idx_of[u.strip()] = int(i.strip())
+            except ValueError:
+                continue
+        held = set()
+        for line in apps.splitlines():
+            p, _, u = line.partition(",")
+            p, u = p.strip(), u.strip()
+            if p.isdigit() and int(p) in pids and u in idx_of:
+                held.add(idx_of[u])
+        return sorted(held) or None
+    except Exception:
+        return None
+
+
+def gpu_indices():
+    """Which cards gpu() shows for --gpus and the current port; None = every card. auto refreshes server_gpus()
+    at most every 5 s like LAST_DETECT does, so its None ("cannot tell") is cached too."""
+    global GPU_CACHE, GPU_CACHE_AT
+    if GPU_OPTION == "all":
+        return None
+    if isinstance(GPU_OPTION, list):
+        return GPU_OPTION
+    if HOST not in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return None
+    if GPU_CACHE_AT is None or time.monotonic() - GPU_CACHE_AT >= 5:
+        GPU_CACHE_AT = time.monotonic()
+        GPU_CACHE = server_gpus(PORT)
+    return GPU_CACHE
 
 
 def bar(frac, width=30):
@@ -585,7 +735,7 @@ def render():
             PREV[key] = (dec, now)
         lines.append(f"Slot {sid}     {state:<5} ctx {used:>7}/{n_ctx}  {bar(used / n_ctx, 20)}{live}")
 
-    lines.append(gpu())
+    lines.extend(gpu(gpu_indices()).splitlines())
     lines.append("-" * 72)
     # Maya's avg covers only the requests its list holds, not the server's whole uptime; the whole footer stays
     # inside 80 columns
@@ -595,12 +745,32 @@ def render():
     return "\n".join(lines)
 
 
+def frame():
+    """One frame for every --port target: each target's block in order, one blank line between, and every
+    distinct footer once, in the order first seen, at the very end. With one target this is byte-identical
+    to render()'s output."""
+    if not PORTS:
+        return render()
+    blocks, footers = [], []
+    for st in PORTS:
+        _load(st)
+        out = render()
+        _store(st)
+        head, sep, last = out.rpartition("\n")
+        if sep and last.endswith("Ctrl+C to exit."):   # a full dashboard: its footer moves to the end
+            out = head
+            if last not in footers:
+                footers.append(last)
+        blocks.append(out)
+    return "\n\n".join(blocks) + "".join("\n" + f for f in footers)
+
+
 def main():
     a = p.parse_args()
     configure(a)
     try:
         while True:
-            out = render()
+            out = frame()
             if a.once:
                 print(out)
                 break
